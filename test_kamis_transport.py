@@ -58,16 +58,19 @@ def test_first_https_succeeds():
     assert r._smart_transport == 'https'
 
 
-def test_http_fallback_used_when_https_ssl_fails():
-    _install([SSLError('handshake'), FakeResp('ok')])
-    r = kamis_request(URL, PARAMS)
-    assert r._smart_transport == 'http-fallback'
-
-
-def test_legacy_https_used_when_first_two_fail():
-    _install([SSLError('a'), SSLError('b'), FakeResp('ok')])
+def test_legacy_https_tried_before_plain_http():
+    """암호화되는 레거시 HTTPS를 평문 HTTP보다 먼저 시도해야 인증키가 덜 노출된다."""
+    calls = _install([SSLError('handshake'), FakeResp('ok')])
     r = kamis_request(URL, PARAMS)
     assert r._smart_transport == 'https-legacy'
+    assert [c[0] for c in calls] == ['https', 'https']
+
+
+def test_http_fallback_used_when_both_https_fail():
+    calls = _install([SSLError('a'), SSLError('b'), FakeResp('ok')])
+    r = kamis_request(URL, PARAMS)
+    assert r._smart_transport == 'http-fallback'
+    assert [c[0] for c in calls] == ['https', 'https', 'http']
 
 
 def test_insecure_last_resort():
@@ -85,7 +88,7 @@ def test_all_fail_reports_every_reason():
         msg = str(ex)
     else:
         raise AssertionError('예외가 발생해야 한다')
-    for lab in ('https', 'http-fallback', 'https-legacy', 'https-insecure'):
+    for lab in ('https', 'https-legacy', 'http-fallback', 'https-insecure'):
         assert lab in msg, msg
     assert 'e4' in msg
 

@@ -5,7 +5,7 @@
 ================================================================
 실행: streamlit run app.py
 """
-import io, copy
+import io, copy, re
 from collections import Counter
 import numpy as np
 import pandas as pd
@@ -156,6 +156,22 @@ def _smart_excluded_gradient_col(name):
     return any(k in s for k in keys)
 
 
+def _smart_cell_text(x):
+    """표 칸 표시용 글자: 실수는 뒤쪽 0을 떼고(1.000000 → 1), 나머지는 pandas 기본 표시와 같다."""
+    if isinstance(x, (float, np.floating)):
+        v = float(x)
+        if not np.isfinite(v):
+            return f"{v:.6f}"            # nan·inf는 예전 표시 그대로
+        if v == 0:
+            return "0"
+        if abs(v) < 1e-6:
+            return f"{v:.2e}"            # 아주 작은 값이 0으로 보이지 않게
+        return f"{v:.6f}".rstrip("0").rstrip(".")
+    if pd.api.types.is_integer(x):
+        return f"{x:.0f}"
+    return x
+
+
 def smart_table(data, *args, **kwargs):
     """st.dataframe 호환 래퍼.
 
@@ -183,6 +199,12 @@ def smart_table(data, *args, **kwargs):
         if isinstance(data, pd.DataFrame):
             shown = sup_display(data)
             sty = shown.style
+            try:
+                # Styler 기본값은 실수를 소수 6자리로 찍어 1 → 1.000000, 2.7 → 2.700000으로 보인다.
+                # 값은 그대로 두고 화면 글자만 뒤쪽 0을 떼어 보여 준다.
+                sty = sty.format(_smart_cell_text)
+            except Exception:
+                pass
             try:
                 # 연한 행 구분 + 파란 머리행
                 def _band_rows(row):
@@ -616,7 +638,7 @@ def error_help(err, context="", key="err"):
                     with st.spinner("AI가 오류를 살펴보는 중..."):
                         st.session_state[_ans_key] = ai_call(
                             prompt, st.session_state.get("api_key"),
-                            st.session_state.get("ai_model_g"), max_tokens=900)
+                            st.session_state.get("ai_model_g"), max_tokens=1500)
                 except Exception as _ex:
                     st.session_state[_ans_key] = f"⚠️ AI 호출 실패: {_ex}"
         c2.link_button("🔎 구글 검색",
@@ -1701,12 +1723,14 @@ def _inject_xlsx_significance_labels(xlsx_bytes, specs):
 
 
 
-def make_xlsx(df, title, chart=True, error_bars=False):
+def make_xlsx(df, title, chart=True, error_bars=False, stacked=False, max_series=3):
     """스마트 블루 표 + 엑셀에서 직접 편집 가능한 차트가 든 xlsx를 만든다.
 
     app(9)의 편집 가능한 Excel 차트 기능을 보존하면서, 화면과 같은 푸른 계열
     머리행·행 구분·숫자 그라데이션·테두리·필터·틀 고정을 적용한다.
     기본 차트는 처리구명 + 평균값을 명확히 보여주고 오차막대는 자동으로 넣지 않는다.
+    stacked=True면 숫자 열을 최대 max_series개까지 누적 막대로 그린다(교차표 등).
+    그래프를 넣지 못하면 '숫자를 고치면 그래프가…' 안내 문구도 넣지 않는다.
     """
     from openpyxl import Workbook
     from openpyxl.chart import BarChart, Reference
@@ -1770,6 +1794,13 @@ def make_xlsx(df, title, chart=True, error_bars=False):
     a2.alignment = Alignment(horizontal='left')
 
     for j, (name, vals, is_num) in enumerate(out_cols, start=1):
+        _int_col = False
+        if is_num:
+            try:
+                _nums = [float(v) for v in vals if v is not None]
+                _int_col = bool(_nums) and all(np.isfinite(x) and float(x).is_integer() for x in _nums)
+            except Exception:
+                _int_col = False
         h = ws.cell(row=HDR, column=j, value=str(name))
         h.font = Font(name=FONT, bold=True, color='FFFFFF', size=10)
         h.fill = PatternFill('solid', fgColor=HEADER)
@@ -1787,7 +1818,10 @@ def make_xlsx(df, title, chart=True, error_bars=False):
             if is_num and v is not None:
                 try:
                     fv = float(v)
-                    cell.number_format = '#,##0.00' if abs(fv) < 1000 else '#,##0.###'
+                    if _int_col:          # 빈도·인원·반복처럼 정수만 있는 열은 '12.00'이 아니라 '12'
+                        cell.number_format = '#,##0'
+                    else:
+                        cell.number_format = '#,##0.00' if abs(fv) < 1000 else '#,##0.###'
                 except Exception:
                     pass
         w = max([len(str(name))] + [len(str(v)) for v in vals[:200]]) * 1.55 + 4
@@ -1799,6 +1833,7 @@ def make_xlsx(df, title, chart=True, error_bars=False):
         ws.auto_filter.ref = f'A{HDR}:{get_column_letter(len(out_cols))}{HDR+nrow}' if nrow else f'A{HDR}:{get_column_letter(len(out_cols))}{HDR}'
 
     if not chart or nrow == 0:
+        a2.value = None
         buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
     # ② 범주축은 원본 표의 첫 번째 열을 우선 사용한다.
@@ -1808,9 +1843,13 @@ def make_xlsx(df, title, chart=True, error_bars=False):
                if j != lab_idx and isn and _xl_is_value_col(nm)]
     err_idx = next((j for j, (nm, _, isn) in enumerate(out_cols, 1)
                     if isn and any(k in str(nm) for k in ('표준편차', '표준오차', 'SD', 'SE'))), None)
+    if stacked:   # 누적 막대에서는 합계 열을 계열로 쌓지 않는다
+        val_idx = [j for j in val_idx
+                   if str(out_cols[j - 1][0]).strip() not in ("합계", "계", "전체", "Total", "total")]
     if lab_idx is None or not val_idx:
+        a2.value = None
         buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
-    val_idx = val_idx[:3]
+    val_idx = val_idx[:max(1, int(max_series))]
 
     ch = BarChart()
     ch.type = 'col'
@@ -1853,8 +1892,14 @@ def make_xlsx(df, title, chart=True, error_bars=False):
         for _ser in ch.series:
             _ser.cat = AxDataSource(strRef=StrRef(f=_cat_formula, strCache=_cache))
 
+    if stacked:
+        ch.grouping = "stacked"
+        ch.overlap = 100
     # 차트도 화면과 같은 스마트 블루. 단일 계열 막대는 처리별로 밝기 그라데이션을 준다.
     _excel_series = ('3D6F9F', '6FA3CF', '9EC5E5')
+    if stacked and len(ch.series) > 3:
+        _excel_series = ('1F4569', '2D5A8E', '4576AB', '6291C2', '82ACD3', 'A3C4E2',
+                         'C2D9EE', 'C96767', 'E9B5B5', '8C8C8C', 'BFBFBF', 'D9D9D9')
     _excel_points = ('C2D9EE', 'A3C4E2', '82ACD3', '6291C2', '4576AB', '2D5A8E', '1F4569')
     for _si, (ser, col) in enumerate(zip(ch.series, _excel_series)):
         try:
@@ -1922,7 +1967,7 @@ def make_xlsx(df, title, chart=True, error_bars=False):
             ch.dLbls.showCatName = False
             ch.dLbls.showSerName = False
             ch.dLbls.showLegendKey = False
-            ch.dLbls.position = "outEnd"
+            ch.dLbls.position = "ctr" if stacked else "outEnd"
             ch.dLbls.numFmt = '0.##'
         except Exception:
             pass
@@ -1945,7 +1990,8 @@ def make_xlsx(df, title, chart=True, error_bars=False):
     ws.add_chart(ch, f'{get_column_letter(len(out_cols) + 2)}{HDR}')
 
     note = HDR + nrow + 2
-    ws.cell(row=note, column=1, value='※ 유의성 문자(a, b, c)가 있는 결과는 그래프의 막대 위에도 자동 표시됩니다.').font = Font(name=FONT, size=9, color='5B6F82')
+    if sig:   # 유의성 문자가 있는 표에서만 안내한다(교차표·설문표에는 해당 없음)
+        ws.cell(row=note, column=1, value='※ 유의성 문자(a, b, c)가 있는 결과는 그래프의 막대 위에도 자동 표시됩니다.').font = Font(name=FONT, size=9, color='5B6F82')
     if error_bars and err_idx and len(val_idx) == 1:
         ws.cell(row=note + 1, column=1,
                 value=f"※ 오차막대는 '{out_cols[err_idx - 1][0]}' 열을 사용했습니다.").font = Font(name=FONT, size=9, color='5B6F82')
@@ -1987,12 +2033,14 @@ def _rewrite_chart_sheet_refs(chart, new_sheet, old_sheet='데이터'):
 def make_xlsx_multi(blocks, doc_title='분석 결과'):
     """여러 분석 결과를 항목별 시트로 나누고, 각 시트에 스마트 블루 표/편집가능 차트를 담는다."""
     from openpyxl import load_workbook
+    # 블록 키(엑셀에만 쓰임, 한글·워드 보고서는 영향 없음)
+    #   xlsx_table : 화면용 문자 표 대신 엑셀에 넣을 숫자 표 (예: '12명 (33.3%)' → 12)
+    #   xlsx_opts  : make_xlsx 차트 옵션 (예: {"stacked": True, "max_series": 12})
+    #   xlsx_extra : [(시트 제목, 표), ...] 그래프 없이 덧붙일 표 (예: 비율표)
     used, sheets = set(), []
-    for b in blocks:
-        tb = b.get('table')
-        if tb is None or not len(tb):
-            continue
-        nm = str(b.get('caption') or '결과')
+
+    def _sheet_name(raw):
+        nm = str(raw or '결과')
         for bad in ':\\/?*[]':
             nm = nm.replace(bad, ' ')
         nm = (nm.strip() or '결과')[:28]
@@ -2000,11 +2048,21 @@ def make_xlsx_multi(blocks, doc_title='분석 결과'):
         while nm in used:
             nm = f'{base[:26]}_{i}'; i += 1
         used.add(nm)
-        sheets.append((nm, tb, str(b.get('caption') or doc_title)))
+        return nm
+
+    for b in blocks:
+        tb = b.get('xlsx_table') if b.get('xlsx_table') is not None else b.get('table')
+        if tb is None or not len(tb):
+            continue
+        cap = str(b.get('caption') or doc_title)
+        sheets.append((_sheet_name(b.get('caption')), tb, cap, dict(b.get('xlsx_opts') or {})))
+        for _xcap, _xtb in (b.get('xlsx_extra') or []):
+            if _xtb is not None and len(_xtb):
+                sheets.append((_sheet_name(_xcap), _xtb, str(_xcap), {"chart": False}))
     if not sheets:
         return None
 
-    first = io.BytesIO(make_xlsx(sheets[0][1], sheets[0][2]))
+    first = io.BytesIO(make_xlsx(sheets[0][1], sheets[0][2], **sheets[0][3]))
     wb = load_workbook(first)
     first_ws = wb.active
     first_name = sheets[0][0]
@@ -2017,8 +2075,8 @@ def make_xlsx_multi(blocks, doc_title='분석 결과'):
     for ch in getattr(first_ws, '_charts', []):
         _rewrite_chart_sheet_refs(ch, first_name)
 
-    for nm, tb, cap in sheets[1:]:
-        src = load_workbook(io.BytesIO(make_xlsx(tb, cap)))
+    for nm, tb, cap, opts in sheets[1:]:
+        src = load_workbook(io.BytesIO(make_xlsx(tb, cap, **opts)))
         ws_src = src.active
         ws = wb.create_sheet(nm)
         # 병합 셀/행 높이/열 너비/셀 스타일을 최대한 그대로 복사한다.
@@ -2052,7 +2110,7 @@ def make_xlsx_multi(blocks, doc_title='분석 결과'):
     buf = io.BytesIO(); wb.save(buf)
     _raw = buf.getvalue()
     _specs = {}
-    for _nm, _tb, _cap in sheets:
+    for _nm, _tb, _cap, _opts in sheets:
         _specs.update(_xlsx_sig_specs_for_df(_tb, _nm, 4))
     _raw = _inject_xlsx_significance_labels(_raw, _specs)
     return _raw
@@ -3112,7 +3170,7 @@ def test_ai_connection(provider, api_key, model):
         if "401" in r or "auth" in low or "unauthor" in low or "api key" in low:
             out["message"] = "인증 실패 — API 키를 다시 확인해 주세요."
         elif "404" in r or "not found" in low or "model" in low:
-            out["message"] = f"모델 '{model}'을(를) 찾을 수 없습니다. 모델명을 확인해 주세요."
+            out["message"] = f"모델 '{model}'{_josa(model, '을/를')} 찾을 수 없습니다. 모델명을 확인해 주세요."
         elif "429" in r or "rate" in low or "quota" in low:
             out["message"] = "사용량 한도에 걸렸습니다. 잠시 후 다시 시도해 주세요."
         elif "timeout" in low or "timed out" in low:
@@ -3183,6 +3241,11 @@ def _ai_error_message(code, body=""):
     return f"⚠️ 호출 실패({code}): {b}"
 
 
+# 답변이 출력 토큰 한도에 걸려 중간에 끊기면 조용히 잘린 채로 보이지 않게 알려 준다.
+_AI_TRUNC_NOTE = ("\n\n…(답변이 길어 여기서 끊겼습니다. 이어서 보려면 "
+                  "'이어서 설명해줘'라고 물어보세요.)")
+
+
 def call_claude(prompt, api_key, model, max_tokens=900, system=None, timeout=60):
     """Claude(Anthropic) 호출"""
     if not _HAS_ANTHROPIC:
@@ -3197,6 +3260,8 @@ def call_claude(prompt, api_key, model, max_tokens=900, system=None, timeout=60)
         text = "".join(parts).strip()
         if not text:
             return "⚠️ 응답이 비어 있습니다(안전 필터 차단 또는 토큰 부족 가능성)."
+        if getattr(msg, "stop_reason", "") == "max_tokens":
+            text += _AI_TRUNC_NOTE
         return text
     except Exception as ex:
         msg = _ai_mask(f"{type(ex).__name__}: {ex}", api_key)
@@ -3204,7 +3269,7 @@ def call_claude(prompt, api_key, model, max_tokens=900, system=None, timeout=60)
         if "authentication" in low or "401" in msg or "api key" in low:
             return "⚠️ 인증 실패 — API 키를 다시 확인해 주세요."
         if "not_found" in low or "404" in msg or "model" in low:
-            return f"⚠️ 모델 '{model}'을(를) 찾을 수 없습니다."
+            return f"⚠️ 모델 '{model}'{_josa(model, '을/를')} 찾을 수 없습니다."
         if "rate" in low or "429" in msg:
             return "⚠️ 사용량 한도 초과 — 잠시 후 다시 시도해 주세요."
         if "timeout" in low:
@@ -3288,8 +3353,10 @@ def call_gemini(prompt, api_key, model, max_tokens=900, system=None, timeout=60)
     if not _HAS_REQUESTS:
         return "⚠️ requests 라이브러리가 없습니다. (pip install requests)"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    # Gemini 2.5·3 계열은 내부 '생각' 토큰도 maxOutputTokens에 포함돼 답이 중간에 끊기기 쉽다.
+    _thinking = bool(re.match(r"gemini-(2\.5|[3-9])", str(model).lower()))
     payload = {"contents": [{"parts": [{"text": prompt}]}],
-               "generationConfig": {"maxOutputTokens": max_tokens}}
+               "generationConfig": {"maxOutputTokens": int(max_tokens) + (4096 if _thinking else 0)}}
     if system:
         payload["systemInstruction"] = {"parts": [{"text": system}]}
     headers = {"x-goog-api-key": api_key, "Content-Type": "application/json"}
@@ -3308,10 +3375,13 @@ def call_gemini(prompt, api_key, model, max_tokens=900, system=None, timeout=60)
             return f"⚠️ 안전 필터에 차단되었습니다(사유: {fb})."
         return "⚠️ Gemini 응답이 비어 있습니다."
     parts = ((cands[0] or {}).get("content") or {}).get("parts") or []
-    text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+    text = "".join(p.get("text", "") for p in parts
+                   if isinstance(p, dict) and not p.get("thought")).strip()
+    fr = (cands[0] or {}).get("finishReason", "")
     if not text:
-        fr = (cands[0] or {}).get("finishReason", "")
         return f"⚠️ Gemini 응답이 비어 있습니다{f'(사유: {fr})' if fr else ''}."
+    if fr == "MAX_TOKENS":
+        text += _AI_TRUNC_NOTE
     return text
 
 
@@ -3366,6 +3436,8 @@ def call_openai(prompt, api_key, model, max_tokens=900, system=None, timeout=60)
                     if value:
                         parts.append(str(value))
         text = "".join(parts).strip()
+    if text and (js.get("incomplete_details") or {}).get("reason", "") == "max_output_tokens":
+        text += _AI_TRUNC_NOTE
     if not text:
         status = js.get("status", "")
         incomplete = (js.get("incomplete_details") or {}).get("reason", "")
@@ -3518,6 +3590,80 @@ def _json_from_ai_text(text):
     return None
 
 
+def _pdf_table_to_df(rows):
+    """pdfplumber 표(행 목록) → DataFrame. 첫 행을 머리글로 쓰고 빈 행·열은 지운다."""
+    rows = [[("" if c is None else re.sub(r"\s*\n\s*", " ", str(c)).strip()) for c in r] for r in rows if r]
+    rows = [r for r in rows if any(x for x in r)]
+    if len(rows) < 2:
+        return None
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    head = [h or f"열{i + 1}" for i, h in enumerate(rows[0])]
+    d = pd.DataFrame(rows[1:], columns=head)
+    d = d.replace("", np.nan).dropna(axis=1, how="all").dropna(axis=0, how="all")
+    if d.shape[0] < 1 or d.shape[1] < 2:
+        return None
+    # '1,200'·'15.5 cm'처럼 숫자로 읽어야 하는 열은 숫자로 바꾼다(90% 이상 숫자일 때만).
+    for c in list(find_numeric_like(d, min_ratio=0.9).keys()):
+        conv = to_numeric_clean(d[c])
+        if conv.notna().sum() >= 0.9 * d[c].notna().sum():
+            d[c] = conv
+    return d
+
+
+def pdf_to_tables(binary, max_pages=30):
+    """글자로 된 PDF(한글·엑셀에서 PDF로 저장한 문서)에서 표를 모두 꺼낸다.
+
+    반환: (표 목록[(이름, DataFrame)], 글자가 있는 쪽 수, 전체 쪽 수)
+    글자가 하나도 없으면 스캔·사진 PDF로 보고 AI 이미지 인식으로 넘긴다.
+    """
+    import pdfplumber
+    out, text_pages, n_pages = [], 0, 0
+    with pdfplumber.open(io.BytesIO(binary)) as pdf:
+        n_pages = len(pdf.pages)
+        for pno, page in enumerate(pdf.pages[:max_pages], start=1):
+            if (page.extract_text() or "").strip():
+                text_pages += 1
+            for tno, tb in enumerate(page.extract_tables() or [], start=1):
+                d = _pdf_table_to_df(tb)
+                if d is not None:
+                    out.append((f"p{pno} 표{tno}", d))
+    return out, text_pages, n_pages
+
+
+_READER_PKG = {"pdfplumber": ("PDF", "pdfplumber"), "pypdfium2": ("스캔 PDF", "pdfplumber"),
+               "xlrd": ("옛 엑셀(xls)", "xlrd"), "openpyxl": ("엑셀(xlsx)", "openpyxl")}
+
+
+def _missing_module_msg(fname, err):
+    """파일 읽기 부품이 서버에 없을 때(ImportError) 사용자에게 보여 줄 안내 문장."""
+    mod = getattr(err, "name", None)
+    if not mod:
+        _mm = re.findall(r"'([A-Za-z0-9_.\-]+)'", str(err))
+        mod = _mm[0] if _mm else ""
+    mod = str(mod).split(".")[0]
+    kind, pkg = _READER_PKG.get(mod, ("이 형식의 파일", mod or "필요한 부품"))
+    return (f"'{fname}' — {kind} 읽기 부품({pkg})이 서버에 설치되지 않아 읽을 수 없습니다. "
+            f"관리자는 requirements.txt에 `{pkg}` 한 줄을 추가한 뒤 앱을 다시 시작(Reboot)해 주세요. "
+            "그 전에는 다른 형식(엑셀 xlsx·CSV)으로 저장해 올리거나 '📷 이미지/사진' 입력을 써 주세요.")
+
+
+def pdf_page_images(binary, max_pages=3, scale=2.0):
+    """PDF 앞쪽 몇 쪽을 PNG로 바꾼다(스캔 PDF를 AI 표 인식에 넘길 때)."""
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(binary)
+    imgs = []
+    try:
+        for i in range(min(len(pdf), max_pages)):
+            pil = pdf[i].render(scale=scale).to_pil()
+            buf = io.BytesIO()
+            pil.save(buf, format="PNG")
+            imgs.append(buf.getvalue())
+    finally:
+        pdf.close()
+    return imgs
+
+
 def image_to_dataframe(binary, mime_type):
     prompt = """이 이미지는 연구/조사 데이터 표입니다. 표의 글자와 숫자를 그대로 읽어 구조화하세요.
 반드시 JSON만 출력하세요. 형식:
@@ -3548,7 +3694,7 @@ def voice_text_to_row(transcript, columns=None):
 현재 열이 있으면 {{"row": {{"열이름": 값, ...}}, "warnings": []}} 형식으로 해당 열 이름을 그대로 사용하세요.
 현재 열이 없으면 {{"row": {{"처리구":"A", "반복":1, ...}}, "warnings": []}} 형태로 의미 있는 열을 만드세요.
 말하지 않은 값은 null로 두고 숫자는 가능하면 숫자형으로 반환하세요. 추측하지 마세요."""
-    raw = ai_call(prompt, max_tokens=1200, system="데이터 입력 도우미입니다. JSON만 출력합니다.")
+    raw = ai_call(prompt, max_tokens=4000, system="데이터 입력 도우미입니다. JSON만 출력합니다.")
     js = _json_from_ai_text(raw)
     if not isinstance(js, dict) or not isinstance(js.get("row"), dict):
         return None, [raw if raw else "음성을 행 데이터로 변환하지 못했습니다."]
@@ -4119,7 +4265,7 @@ def ai_interpret_advanced(slot, kind, table_df, extra="", context=None, capture_
                           f"{extra}\n\n{STYLES[want]}\n\n"
                           "반드시 한국어로 작성하고, 마크다운 기호(**, ##, *, `, ---)는 "
                           "어떤 경우에도 사용하지 마세요. 표에 없는 수치는 만들어 내지 마세요.")
-                raw = ai_call(prompt, key, st.session_state.get("ai_model_g"), max_tokens=1600)
+                raw = ai_call(prompt, key, st.session_state.get("ai_model_g"), max_tokens=2500)
                 if want.startswith("4️⃣"):
                     _parsed, _orig = parse_ai_json(raw)
                     st.session_state[out_key + "_json"] = _parsed
@@ -4296,7 +4442,7 @@ def detect_design(df):
             res["confidence"] = "높음"
         else:
             res["design"] = "난괴법(RCBD, 불균형)"
-            res["reason"] = f"반복 '{blk}'이 있으나 처리구별 반복 수가 고르지 않습니다."
+            res["reason"] = f"반복 '{blk}'{_josa(blk, '이/가')} 있으나 처리구별 반복 수가 고르지 않습니다."
             res["confidence"] = "중간"
     elif others:
         res["sub"] = others[0]
@@ -4342,27 +4488,728 @@ def recommend_analysis(df):
         if msg not in seen: seen.add(msg); out.append(msg)
     return out[:5] if out else ["데이터 구조상 뚜렷한 추천이 어려워요."]
 
-def _josa(word, pair="이/가"):
-    """받침 여부에 따라 조사 선택 (수비초가 / 청양이)"""
-    a, b = pair.split("/")
+_JOSA_DIGIT_JONG = {"0": True, "1": True, "2": False, "3": True, "4": False,
+                    "5": False, "6": True, "7": True, "8": True, "9": False}
+_JOSA_DIGIT_RIEUL = {"1", "7", "8"}             # 일·칠·팔 → ㄹ받침
+# 단어 끝 영문 단위·기호의 읽는 소리 (받침 여부, ㄹ받침 여부)
+_JOSA_TAIL_SOUND = [("kg", True, False), ("mg", True, False), ("g", True, False),
+                    ("cm", False, False), ("mm", False, False), ("km", False, False),
+                    ("m", False, False), ("ha", True, True), ("a", True, True),
+                    ("%", False, False), ("℃", False, False), ("ppm", True, False)]
+
+
+def _josa_last_sound(word):
+    """조사 판단용 (받침 있음, ㄹ받침) 또는 None. 끝의 괄호·따옴표·공백은 무시한다.
+
+    예) '엽수(개)' → '엽수', '수량(kg/10a)' → '수량', '607.6' → 6(육), '10a' → 아르
+    """
     w = str(word).strip()
-    if not w: return a
+    for _ in range(5):                          # 끝 괄호를 반복해서 걷어 낸다
+        w2 = re.sub(r"\s*[\(\[（【][^\(\)\[\]（）【】]*[\)\]）】]\s*$", "", w).strip()
+        w2 = w2.rstrip("'\"’”」』 ")
+        if w2 == w or not w2:
+            break
+        w = w2
+    if not w:
+        return None
     ch = w[-1]
-    if ch.isdigit():   # 숫자로 끝나면 읽는 소리로 판단 (1,3,6,7,8,0=받침 있음)
-        return a if ch in "136078" else b
-    if not ("가" <= ch <= "힣"):
+    if "가" <= ch <= "힣":
+        jong = (ord(ch) - 0xAC00) % 28
+        return bool(jong), jong == 8
+    if ch.isdigit():
+        return _JOSA_DIGIT_JONG[ch], ch in _JOSA_DIGIT_RIEUL
+    low = w.lower()
+    for tail, jong, rieul in _JOSA_TAIL_SOUND:
+        # 단위는 숫자 바로 뒤일 때만 (10a, 120kg). 'ANOVA'의 a는 단위가 아니다.
+        if not low.endswith(tail):
+            continue
+        if tail.isalpha():   # 영문 단위는 숫자 바로 뒤일 때만: '10a'는 아르, 처리구 'A'는 에이
+            if len(low) > len(tail) and low[-len(tail) - 1].isdigit():
+                return jong, rieul
+            continue
+        return jong, rieul
+    if ch.isalpha() and ch.isascii():           # 영문 글자 이름: 엘(L)·엠·엔·알(R)만 받침
+        c = ch.lower()
+        return c in "lmnr", c in "lr"
+    return None
+
+
+def _josa(word, pair="이/가"):
+    """받침 여부에 따라 조사 선택 (수비초가 / 청양이 / 엽수(개)는 / 607.6으로)
+
+    pair: '이/가', '은/는', '을/를', '과/와', '으로/로', '이에요/예요' 처럼 '받침 있을 때/없을 때'.
+    '으로/로'는 ㄹ받침 뒤에서 '로'를 쓴다(서울로, 607.1로).
+    """
+    a, b = pair.split("/")
+    snd = _josa_last_sound(word)
+    if snd is None:
         return a
-    return a if (ord(ch) - 0xAC00) % 28 else b
+    jong, rieul = snd
+    if a == "으로" and rieul:
+        return b
+    return a if jong else b
+
+
+def _ptxt(p, digits=4, spaced=False):
+    """보고서·화면용 p값 문구. 0.0000처럼 보이는 값은 'p<0.0001'로 쓴다."""
+    eq, lt = (" = ", " < ") if spaced else ("=", "<")
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return f"p{eq}-"
+    if not np.isfinite(p):
+        return f"p{eq}-"
+    floor = 10 ** (-int(digits))
+    if p < floor:
+        return f"p{lt}{floor:.{int(digits)}f}"
+    return f"p{eq}{p:.{int(digits)}f}"
+
+# ================================================================ 결과 해석 문장 (규칙 기반, AI 키 불필요)
+# 화면용 💡 쉬운 해석과 보고서용 ○·- 문장을 함께 만든다. 수치는 결과표와 같은 값을 쓰고,
+# 유의하지 않은 결과에는 '효과가 있다'고 쓰지 않는다.
+def _pstar(p):
+    """유의성 별표 (*** p<0.001, ** p<0.01, * p<0.05)."""
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return ""
+    if not np.isfinite(p):
+        return ""
+    return "***" if p < .001 else "**" if p < .01 else "*" if p < .05 else "n.s."
+
+
+def _pcell(p, digits=4):
+    """표 칸용 p값 문자열 (0.0000 대신 <0.0001)."""
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return "-"
+    if not np.isfinite(p):
+        return "-"
+    floor = 10 ** (-int(digits))
+    return f"<{floor:.{int(digits)}f}" if p < floor else f"{p:.{int(digits)}f}"
+
+
+def _fmt_num(v, nd=None):
+    """보고서 문장용 숫자. 크기에 맞춰 자릿수를 정한다."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if not np.isfinite(v):
+        return "-"
+    if nd is None:
+        a = abs(v)
+        nd = 0 if a >= 1000 else 1 if a >= 100 else 2 if a >= 1 else 3 if a >= 0.01 else 4
+    return f"{v:,.{nd}f}"
+
+
+def report_lines(title, items):
+    """시험연구보고서 형식: '○ 제목' + '  - 항목' 줄들."""
+    items = [str(x).strip() for x in items if str(x or "").strip()]
+    return "\n".join([f"○ {title}"] + [f"  - {x}" for x in items])
+
+
+def show_interp(easy, report=None, label="📋 보고서용 결과 문장"):
+    """💡 쉬운 해석(화면) + 📋 보고서용 문장(복사 버튼)."""
+    if easy:
+        st.info("💡 " + str(easy))
+    if report:
+        st.markdown(f"###### {label}")
+        st.code(report, language=None, wrap_lines=True)
+
+
+def _qt(name):
+    """해석 문장에서 열 이름을 작은따옴표로 감싼다."""
+    return f"'{name}'"
+
+
+def interp_regression(model, y, xs, data=None):
+    """선형회귀 결과 → (한국어 계수표, 쉬운 해석, 보고서 문장, 주의사항 목록)."""
+    params, bse, tv, pv = model.params, model.bse, model.tvalues, model.pvalues
+    ci = model.conf_int()
+    sd_y = float(np.std(model.model.endog, ddof=1)) if len(model.model.endog) > 1 else np.nan
+    exog = pd.DataFrame(model.model.exog, columns=model.model.exog_names)
+    rows = []
+    for name in params.index:
+        is_const = str(name) == "const"
+        beta = np.nan
+        if not is_const and name in exog.columns and sd_y and np.isfinite(sd_y) and sd_y > 0:
+            beta = float(params[name]) * float(np.std(exog[name], ddof=1)) / sd_y
+        rows.append({"변수": "절편" if is_const else str(name),
+                     "회귀계수": round(float(params[name]), 4),
+                     "표준오차": round(float(bse[name]), 4),
+                     "t값": round(float(tv[name]), 3),
+                     "p값": _pcell(pv[name]),
+                     "95% 신뢰구간": f"{float(ci.loc[name, 0]):.4g} ~ {float(ci.loc[name, 1]):.4g}",
+                     "표준화계수(β)": ("-" if is_const or not np.isfinite(beta) else f"{beta:.3f}"),
+                     "유의성": "" if is_const else _pstar(pv[name])})
+    coef = pd.DataFrame(rows)
+    n, k = int(model.nobs), len(xs)
+    r2, ar2 = float(model.rsquared), float(model.rsquared_adj)
+    f_p = float(model.f_pvalue) if model.f_pvalue is not None else np.nan
+    model_sig = np.isfinite(f_p) and f_p < .05
+    sig_vars = [x for x in xs if float(pv.get(x, 1)) < .05]
+    ns_vars = [x for x in xs if x not in sig_vars]
+
+    def _effect(x):
+        b = float(params[x])
+        word = "증가" if b > 0 else "감소"
+        return (f"{_qt(x)}{_josa(x, '이/가')} 1 늘면 {_qt(y)}{_josa(y, '은/는')} "
+                f"{_fmt_num(abs(b))}만큼 {word}함({_ptxt(pv[x], 4)})")
+
+    easy = (f"이 모형은 {_qt(y)} 변동의 {r2*100:.1f}%를 설명하며, 모형 전체는 "
+            + ("통계적으로 유의합니다" if model_sig else "통계적으로 유의하지 않습니다")
+            + f"({_ptxt(f_p, 4)}, n={n}). ")
+    if sig_vars:
+        easy += " / ".join(_effect(x) for x in sig_vars) + ". "
+    if ns_vars:
+        easy += (", ".join(_qt(x) for x in ns_vars)
+                 + f"{_josa(ns_vars[-1], '은/는')} 유의한 영향이 없었습니다.")
+    eq_terms = []
+    for x in xs:
+        b = float(params[x])
+        eq_terms.append(f"{'+' if b >= 0 else '−'} {_fmt_num(abs(b))}×{x}")
+    eq = f"{y} = {_fmt_num(float(params.get('const', 0)))} " + " ".join(eq_terms)
+    items = [f"회귀모형은 " + ("통계적으로 유의하였으며" if model_sig else "통계적으로 유의하지 않았으며")
+             + f"(F={float(model.fvalue):.2f}, {_ptxt(f_p, 4)}), 결정계수(R²)는 {r2:.3f}"
+             f"(수정 R² {ar2:.3f}){_josa(f'{ar2:.3f}', '으로/로')} 나타났다.",
+             f"회귀식은 {eq}이다."]
+    for x in sig_vars:
+        b = float(params[x])
+        items.append(f"{x}{_josa(x, '은/는')} {y}에 유의한 {'정(+)' if b > 0 else '부(−)'}의 영향을 미쳤다"
+                     f"(β={coef.loc[coef['변수'] == x, '표준화계수(β)'].iloc[0]}, {_ptxt(pv[x], 4)}).")
+    if ns_vars:
+        items.append(", ".join(ns_vars) + f"{_josa(ns_vars[-1], '은/는')} 유의한 영향을 미치지 않았다(p≥0.05).")
+    report = report_lines(f"{y}에 대한 회귀분석 결과", items)
+    cautions = []
+    if n < 10 * max(k, 1):
+        cautions.append(f"표본 수(n={n})가 독립변수 수({k}개)에 비해 적습니다(변수당 10개 이상 권장). "
+                        "계수가 불안정할 수 있으니 해석에 주의하세요.")
+    try:
+        if float(model.condition_number) > 1000 and k >= 2:
+            cautions.append("독립변수끼리 서로 강하게 관련되어 있을 가능성이 있습니다(조건수가 큼). "
+                            "아래 VIF를 확인하고, 계수의 크기·부호 해석에 주의하세요.")
+    except Exception:
+        pass
+    return coef, easy, report, cautions
+
+
+def interp_logit(res, y, xs, pos_label, acc=None):
+    """로지스틱 회귀(statsmodels Logit) → (계수·오즈비 표, 쉬운 해석, 보고서 문장)."""
+    params, pv = res.params, res.pvalues
+    ci = res.conf_int()
+    rows = []
+    for name in params.index:
+        is_const = str(name) == "const"
+        rows.append({"변수": "절편" if is_const else str(name),
+                     "회귀계수": round(float(params[name]), 4),
+                     "표준오차": round(float(res.bse[name]), 4),
+                     "p값": _pcell(pv[name]),
+                     "오즈비(OR)": "-" if is_const else f"{float(np.exp(params[name])):.3f}",
+                     "OR 95% 신뢰구간": "-" if is_const else
+                     f"{float(np.exp(ci.loc[name, 0])):.3g} ~ {float(np.exp(ci.loc[name, 1])):.3g}",
+                     "유의성": "" if is_const else _pstar(pv[name])})
+    tbl = pd.DataFrame(rows)
+    sig_vars = [x for x in xs if float(pv.get(x, 1)) < .05]
+    ns_vars = [x for x in xs if x not in sig_vars]
+    lr_p = float(getattr(res, "llr_pvalue", np.nan))
+    pr2 = float(getattr(res, "prsquared", np.nan))
+
+    def _or_txt(x):
+        o = float(np.exp(params[x]))
+        ch = (o - 1) * 100
+        return (f"{_qt(x)}{_josa(x, '이/가')} 1 늘면 '{pos_label}'일 오즈가 {o:.2f}배"
+                f"({'+' if ch >= 0 else '−'}{abs(ch):.0f}%)가 됨({_ptxt(pv[x], 4)})")
+
+    easy = (f"'{pos_label}'일 확률을 예측하는 모형은 "
+            + ("통계적으로 유의합니다" if np.isfinite(lr_p) and lr_p < .05 else "통계적으로 유의하지 않습니다")
+            + f"(우도비 검정 {_ptxt(lr_p, 4)}, McFadden R²={pr2:.3f}). ")
+    if sig_vars:
+        easy += " / ".join(_or_txt(x) for x in sig_vars) + ". "
+    if ns_vars:
+        easy += ", ".join(_qt(x) for x in ns_vars) + f"{_josa(ns_vars[-1], '은/는')} 유의한 영향이 없었습니다."
+    items = [f"{y}{_josa(y, '이/가')} '{pos_label}'일 확률에 대한 로지스틱 회귀모형은 "
+             + ("유의하였다" if np.isfinite(lr_p) and lr_p < .05 else "유의하지 않았다")
+             + f"(우도비 검정 {_ptxt(lr_p, 4)}, McFadden R²={pr2:.3f})."]
+    for x in sig_vars:
+        o = float(np.exp(params[x]))
+        items.append(f"{x}{_josa(x, '이/가')} 1 증가할 때 '{pos_label}'일 오즈는 {o:.2f}배로 "
+                     f"{'증가' if o > 1 else '감소'}하였다({_ptxt(pv[x], 4)}).")
+    if ns_vars:
+        items.append(", ".join(ns_vars) + f"{_josa(ns_vars[-1], '은/는')} 유의한 영향을 미치지 않았다(p≥0.05).")
+    if acc is not None:
+        items.append(f"학습 자료 기준 분류 정확도는 {acc*100:.1f}%였다(참고용).")
+    return tbl, easy, report_lines(f"{y}에 대한 로지스틱 회귀분석 결과", items)
+
+
+def interp_probit(res):
+    """프로빗 결과표 → (쉬운 해석, 보고서 문장). 계통이 둘 이상이면 저항성비와 신뢰구간 겹침을 본다."""
+    ok = res[pd.to_numeric(res.get("LC50"), errors="coerce").notna()].copy() if "LC50" in res else res.iloc[0:0]
+    if ok.empty:
+        msg = "LC50을 계산할 수 있는 자료가 없습니다. 농도 수준과 사충 반응을 확인하세요."
+        return msg, report_lines("프로빗 분석 결과", [msg])
+    ok["LC50"] = pd.to_numeric(ok["LC50"])
+    items, easy_parts = [], []
+    for _, r in ok.iterrows():
+        lo, hi = r.get("95% 하한"), r.get("95% 상한")
+        ci_txt = (f"(95% 신뢰구간 {_fmt_num(lo)}~{_fmt_num(hi)})"
+                  if pd.notna(lo) and pd.notna(hi) else "")
+        lc90 = r.get("LC90")
+        name = "" if str(r["구분"]) == "전체" else f"{r['구분']}의 "
+        items.append(f"{name}LC50은 {_fmt_num(r['LC50'])}{ci_txt}, LC90은 {_fmt_num(lc90)}"
+                     f"{_josa(_fmt_num(lc90), '이었/였')}다(기울기 {r.get('기울기')}).")
+        easy_parts.append(f"{name}LC50 {_fmt_num(r['LC50'])}")
+        fp = r.get("적합도 p")
+        if fp not in (None, "-") and pd.notna(pd.to_numeric(fp, errors="coerce")) and float(fp) < .05:
+            items.append(f"{name}적합도 검정이 유의하여({_ptxt(fp, 3)}) 자료가 프로빗 모형에서 다소 벗어나므로 "
+                         "신뢰구간 해석에 주의가 필요하다.")
+    easy = "프로빗 분석 결과 " + ", ".join(easy_parts) + "입니다. LC50이 작을수록 낮은 농도에서 효과가 나타납니다."
+    if len(ok) >= 2:
+        base = ok.loc[ok["LC50"].idxmin()]
+        for _, r in ok.iterrows():
+            if r["구분"] == base["구분"]:
+                continue
+            rr = float(r["LC50"]) / float(base["LC50"]) if float(base["LC50"]) > 0 else np.nan
+            overlap = None
+            try:
+                overlap = not (float(r["95% 하한"]) > float(base["95% 상한"])
+                               or float(base["95% 하한"]) > float(r["95% 상한"]))
+            except (TypeError, ValueError, KeyError):
+                overlap = None
+            s = (f"{r['구분']}의 LC50은 {base['구분']}의 {rr:.1f}배(저항성비)였으며, "
+                 + ("95% 신뢰구간이 겹쳐 감수성 차이는 뚜렷하지 않았다." if overlap
+                    else "95% 신뢰구간이 겹치지 않아 감수성에 차이가 있었다." if overlap is False
+                    else "신뢰구간을 계산하지 못해 차이 여부는 판단하지 않았다."))
+            items.append(s)
+        easy += f" 가장 민감한 '{base['구분']}' 대비 저항성비는 보고서용 문장을 확인하세요."
+    return easy, report_lines("프로빗 분석 결과", items)
+
+
+def interp_corr_report(corr, pmat, sel, method):
+    """상관분석 → 보고서 문장 (유의한 쌍 중심)."""
+    pairs = []
+    for i, a in enumerate(sel):
+        for b in sel[i + 1:]:
+            try:
+                r, p = float(corr.loc[a, b]), float(pmat.loc[a, b])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if np.isfinite(r) and np.isfinite(p):
+                pairs.append((a, b, r, p))
+    sig = sorted([x for x in pairs if x[3] < .05], key=lambda x: -abs(x[2]))
+    items = [f"{len(sel)}개 변수 간 {method} 상관분석 결과, {len(pairs)}개 변수쌍 중 "
+             f"{len(sig)}개에서 유의한 상관이 나타났다."]
+    for a, b, r, p in sig[:5]:
+        strength = "강한" if abs(r) >= .7 else "뚜렷한" if abs(r) >= .4 else "약한"
+        items.append(f"{a}{_josa(a, '과/와')} {b}{_josa(b, '은/는')} {strength} "
+                     f"{'정(+)' if r > 0 else '부(−)'}의 상관을 보였다(r={r:.3f}, {_ptxt(p, 4)}).")
+    if len(sig) > 5:
+        items.append(f"그 밖의 유의한 상관 {len(sig) - 5}쌍은 상관계수표를 참고한다.")
+    if not sig:
+        items.append("유의한 상관을 보인 변수쌍은 없었다(p≥0.05).")
+    return report_lines(f"{method} 상관분석 결과", items)
+
+
+def interp_twoway(aov, f1, f2, yv, data, blk=None):
+    """이원배치 → (쉬운 해석, 보고서 문장)."""
+    def _p(term):
+        return float(aov.loc[term, "PR(>F)"]) if term in aov.index else np.nan
+    kA, kB = f"C({q_ref(f1)})", f"C({q_ref(f2)})"
+    kI = f"C({q_ref(f1)}):C({q_ref(f2)})"
+    pA, pB, pI = _p(kA), _p(kB), _p(kI)
+    cell = data.groupby([f1, f2])[yv].mean()
+    best = cell.idxmax() if len(cell) else None
+
+    def _sig(p):
+        return "유의하였다" if np.isfinite(p) and p < .05 else "유의하지 않았다"
+    easy = (f"'{f1}' 효과는 {'유의' if pA < .05 else '비유의'}({_ptxt(pA, 4)}), "
+            f"'{f2}' 효과는 {'유의' if pB < .05 else '비유의'}({_ptxt(pB, 4)}), "
+            f"상호작용은 {'유의' if pI < .05 else '비유의'}({_ptxt(pI, 4)})입니다. ")
+    if np.isfinite(pI) and pI < .05:
+        easy += "상호작용이 유의하므로 요인별 평균보다 조합별 평균으로 해석하세요. "
+    if best is not None:
+        easy += f"평균이 가장 높은 조합은 {f1}={best[0]}, {f2}={best[1]}({_fmt_num(cell.max())})입니다."
+    items = [f"{f1}의 효과는 {_sig(pA)}({_ptxt(pA, 4)}).",
+             f"{f2}의 효과는 {_sig(pB)}({_ptxt(pB, 4)}).",
+             f"{f1}×{f2} 상호작용은 " + ("유의하여 두 요인의 조합에 따라 반응이 달랐다" if pI < .05
+                                      else "유의하지 않았다") + f"({_ptxt(pI, 4)})."]
+    if best is not None:
+        items.append(f"{yv}{_josa(yv, '은/는')} {f1} {best[0]}·{f2} {best[1]} 조합에서 "
+                     f"{_fmt_num(cell.max())}{_josa(_fmt_num(cell.max()), '으로/로')} 가장 높았다.")
+    if blk:
+        items.append(f"블록(반복) 효과를 모형에 포함하여 분석하였다(블록 열: {blk}).")
+    return easy, report_lines(f"{f1}×{f2}에 따른 {yv} 이원배치 분산분석 결과", items)
+
+
+def interp_splitplot(main_c, sub_c, yv, p_main, p_sub, p_int, piv, cva=None, cvb=None):
+    """분할구 → 보고서 문장."""
+    def _sig(p):
+        return "유의하였다" if p < .05 else "유의하지 않았다"
+    items = [f"주구인 {main_c}의 효과는 {_sig(p_main)}({_ptxt(p_main, 4)}).",
+             f"세구인 {sub_c}의 효과는 {_sig(p_sub)}({_ptxt(p_sub, 4)}).",
+             f"{main_c}×{sub_c} 상호작용은 " + ("유의하여 조합별 해석이 필요하였다" if p_int < .05
+                                            else "유의하지 않았다") + f"({_ptxt(p_int, 4)})."]
+    try:
+        st_ = piv.stack()
+        b = st_.idxmax()
+        items.append(f"{yv}{_josa(yv, '은/는')} {main_c} {b[0]}·{sub_c} {b[1]}에서 "
+                     f"{_fmt_num(st_.max())}{_josa(_fmt_num(st_.max()), '으로/로')} 가장 높았다.")
+    except Exception:
+        pass
+    if cva is not None and cvb is not None and np.isfinite(cva) and np.isfinite(cvb):
+        items.append(f"변이계수는 주구 CV(a) {cva:.1f}%, 세구 CV(b) {cvb:.1f}%였다.")
+    return report_lines(f"{main_c}(주구)×{sub_c}(세구) 분할구 분산분석 결과", items)
+
+
+def gg_epsilon(data, subj, within, yv):
+    """Greenhouse-Geisser ε (구형성 위반 정도, 1이면 구형성 만족). 계산 불가면 nan."""
+    try:
+        wide = data.pivot_table(index=subj, columns=within, values=yv, aggfunc="mean").dropna()
+        k = wide.shape[1]
+        if k < 3 or len(wide) < 3:
+            return np.nan
+        S = np.cov(wide.to_numpy(dtype=float), rowvar=False)
+        # 정규직교 대비(contrast) 행렬: 평균과 직교하는 k-1개 축
+        H = np.eye(k) - np.ones((k, k)) / k
+        u, _, _ = np.linalg.svd(H)
+        C = u[:, :k - 1]
+        lam = np.linalg.eigvalsh(C.T @ S @ C)
+        return float(lam.sum() ** 2 / ((k - 1) * (lam ** 2).sum()))
+    except Exception:
+        return np.nan
+
+
+def interp_rm(within, yv, p, res, eps=None, p_gg=None):
+    """반복측정 → (쉬운 해석, 보고서 문장). res: 시기별 평균표(시기, 평균, 표준편차, n)."""
+    items = [f"{within}에 따른 {yv}의 변화는 "
+             + ("유의하였다" if p < .05 else "유의하지 않았다") + f"({_ptxt(p, 4)})."]
+    easy = f"조사 시기에 따라 '{yv}'{_josa(yv, '이/가')} " + ("유의하게 변했습니다" if p < .05 else "유의하게 변하지 않았습니다") + f"({_ptxt(p, 4)}). "
+    try:
+        r = res.set_index(res.columns[0])["평균"].astype(float)
+        first, last = r.index[0], r.index[-1]
+        hi = r.idxmax()
+        ch = r.iloc[-1] - r.iloc[0]
+        items.append(f"{yv}{_josa(yv, '은/는')} {first} {_fmt_num(r.iloc[0])}에서 {last} {_fmt_num(r.iloc[-1])}"
+                     f"{_josa(_fmt_num(r.iloc[-1]), '으로/로')} {'증가' if ch > 0 else '감소' if ch < 0 else '변화 없음'}하였고, "
+                     f"{hi}에 {_fmt_num(r.max())}{_josa(_fmt_num(r.max()), '으로/로')} 가장 높았다.")
+        easy += f"평균은 {first} {_fmt_num(r.iloc[0])} → {last} {_fmt_num(r.iloc[-1])}입니다."
+    except Exception:
+        pass
+    if eps is not None and np.isfinite(eps) and p_gg is not None and np.isfinite(p_gg):
+        if eps < 0.75:
+            items.append(f"구형성 가정이 충족되지 않아(Greenhouse-Geisser ε={eps:.3f}) 자유도를 보정한 결과 "
+                         + ("유의하였다" if p_gg < .05 else "유의하지 않았다") + f"({_ptxt(p_gg, 4)}).")
+            easy += f" 구형성 보정(GG) 후 {_ptxt(p_gg, 4)}입니다."
+        else:
+            items.append(f"Greenhouse-Geisser ε={eps:.3f}로 구형성 위반은 크지 않았다"
+                         f"(보정 {_ptxt(p_gg, 4)}).")
+    return easy, report_lines(f"{within}별 {yv} 반복측정 분산분석 결과", items)
+
+
+def interp_ancova(gc, yv, cov, p, p_int, res):
+    """ANCOVA → 보고서 문장. res: 처리구, 원평균, 보정평균 열 포함."""
+    items = []
+    if p_int is not None and np.isfinite(p_int):
+        items.append("처리×공변량 상호작용이 " + ("유의하여 회귀기울기 동일 가정이 위배되었으므로 해석에 주의가 필요하다"
+                                          if p_int < .05 else "유의하지 않아 회귀기울기 동일 가정을 만족하였다")
+                     + f"({_ptxt(p_int, 4)}).")
+    items.append(f"{cov}{_josa(cov, '을/를')} 공변량으로 보정한 결과, {gc} 간 {yv}의 차이는 "
+                 + ("유의하였다" if p < .05 else "유의하지 않았다") + f"({_ptxt(p, 4)}).")
+    try:
+        r = res.set_index(gc)["보정평균"].astype(float)
+        items.append(f"보정평균은 {r.idxmax()}에서 {_fmt_num(r.max())}{_josa(_fmt_num(r.max()), '으로/로')} 가장 높고, "
+                     f"{r.idxmin()}에서 {_fmt_num(r.min())}{_josa(_fmt_num(r.min()), '으로/로')} 가장 낮았다.")
+    except Exception:
+        pass
+    return report_lines(f"{cov} 보정 {gc}별 {yv} 공분산분석 결과", items)
+
+
+def interp_multi_summary(gc, ph, notes, data, traits):
+    """여러 형질 요약표 → (쉬운 해석, 보고서 문장)."""
+    items, n_sig = [], 0
+    for nt in notes:
+        tr, pv = nt.get("항목"), nt.get("p-value")
+        try:
+            # 표에는 '<0.0001'처럼 글자로 담긴다 → 경계값보다 작은 값으로 읽어 문장에도 'p<0.0001'로 쓴다
+            p = float(str(pv).strip().lstrip("<")) * (0.5 if str(pv).strip().startswith("<") else 1)
+        except (TypeError, ValueError):
+            items.append(f"{tr}{_josa(tr, '은/는')} 분산분석을 할 수 없었다.")
+            continue
+        m = data.groupby(gc)[tr].mean()
+        if p < .05:
+            n_sig += 1
+            items.append(f"{tr}{_josa(tr, '은/는')} 처리 간 유의한 차이가 있었으며({_ptxt(p, 4)}), "
+                         f"{m.idxmax()}에서 {_fmt_num(m.max())}{_josa(_fmt_num(m.max()), '으로/로')} 가장 높았다.")
+        else:
+            items.append(f"{tr}{_josa(tr, '은/는')} 처리 간 유의한 차이가 없었다({_ptxt(p, 4)}).")
+    easy = (f"{len(traits)}개 형질 중 {n_sig}개에서 처리 간 유의한 차이가 있었습니다. "
+            "같은 문자를 가진 처리구끼리는 통계적 차이가 없습니다.")
+    items.append(f"평균 간 비교는 {ph}(p<0.05){_josa(ph, '으로/로')} 실시하였다.")
+    return easy, report_lines(f"{gc}별 형질 분석 결과", items)
+
+
+def interp_nonparam(test, g, v, stat, p, med, posthoc_pairs=None):
+    """비모수 검정 → (쉬운 해석, 보고서 문장)."""
+    why = "정규성·등분산 가정을 전제하지 않는"
+    easy = (f"{test} 검정 결과 {g} 간 {v}의 차이는 "
+            + ("통계적으로 유의합니다" if p < .05 else "유의하지 않습니다") + f"({_ptxt(p, 4)}). ")
+    items = [f"{v}에 대해 {why} {test} 검정을 실시한 결과, {g} 간 차이는 "
+             + ("유의하였다" if p < .05 else "유의하지 않았다") + f"(검정통계량 {stat:.3f}, {_ptxt(p, 4)})."]
+    try:
+        r = med.set_index(med.columns[0])["중앙값"].astype(float)
+        items.append(f"중앙값은 {r.idxmax()}에서 {_fmt_num(r.max())}{_josa(_fmt_num(r.max()), '으로/로')} 가장 높고 "
+                     f"{r.idxmin()}에서 {_fmt_num(r.min())}{_josa(_fmt_num(r.min()), '으로/로')} 가장 낮았다.")
+        easy += f"중앙값이 가장 높은 그룹은 '{r.idxmax()}'입니다."
+    except Exception:
+        pass
+    if posthoc_pairs is not None:
+        if posthoc_pairs:
+            items.append("Dunn 사후검정(Bonferroni 보정) 결과 유의한 차이를 보인 쌍은 "
+                         + ", ".join(f"{a}–{b}" for a, b in posthoc_pairs[:6])
+                         + (f" 외 {len(posthoc_pairs) - 6}쌍" if len(posthoc_pairs) > 6 else "") + "이었다.")
+        else:
+            items.append("Dunn 사후검정(Bonferroni 보정)에서 유의한 차이를 보인 쌍은 없었다.")
+    return easy, report_lines(f"{g}별 {v} 비모수 검정 결과", items)
+
+
+def interp_pca(evr, load):
+    """PCA → (쉬운 해석, 보고서 문장). load: 변수, PC1, PC2."""
+    tot = float(np.sum(evr)) * 100
+    lv = load.set_index("변수")
+
+    def _top(pc):
+        s = lv[pc].astype(float)
+        idx = s.abs().sort_values(ascending=False).index[:3]
+        return ", ".join(f"{i}({s[i]:+.2f})" for i in idx)
+    easy = (f"주성분 2개가 원래 정보의 {tot:.1f}%를 설명합니다"
+            + (" (70% 이상 — 2차원 그림으로 해석해도 무방)" if tot >= 70 else " (70% 미만 — 그림 해석에 주의)")
+            + f". PC1에는 {_top('PC1')}, PC2에는 {_top('PC2')}의 기여가 큽니다.")
+    items = [f"제1·2주성분의 누적 설명력은 {tot:.1f}%(PC1 {evr[0]*100:.1f}%, PC2 {evr[1]*100:.1f}%)였다.",
+             f"제1주성분은 {_top('PC1')}, 제2주성분은 {_top('PC2')}의 적재값이 컸다."]
+    if tot < 70:
+        items.append("누적 설명력이 70% 미만이므로 두 주성분만으로 전체 변이를 해석하는 데 한계가 있다.")
+    return easy, report_lines("주성분분석(PCA) 결과", items)
+
+
+def interp_ml(algo, tgt, is_reg, score, n_train, n_test, imp=None, imp_method=None):
+    """머신러닝 → (쉬운 해석, 보고서 문장)."""
+    if is_reg:
+        level = ("매우 높음" if score >= .9 else "높음" if score >= .7 else "보통" if score >= .5
+                 else "낮음" if score >= 0 else "평균값 예측보다도 낮음")
+        perf = f"테스트 R² {score:.3f}({level})"
+    else:
+        level = "높음" if score >= .9 else "양호" if score >= .75 else "보통" if score >= .6 else "낮음"
+        perf = f"테스트 정확도 {score*100:.1f}%({level})"
+    easy = f"[{algo}] 모델의 예측 성능은 {perf}입니다. "
+    items = [f"{algo} 모델로 {tgt}{_josa(tgt, '을/를')} 예측한 결과 {perf}{_josa(level, '이었/였')}다"
+             f"(학습 {n_train}개, 검증 {n_test}개)."]
+    if imp is not None and len(imp) and float(imp["중요도"].max()) > 0:
+        top = imp.head(3)
+        easy += "영향이 큰 변수는 " + ", ".join(f"'{r['변수']}'" for _, r in top.iterrows()) + " 순입니다. "
+        items.append(f"{imp_method or '변수 중요도'} 기준으로 " + ", ".join(top["변수"].astype(str))
+                     + " 순으로 영향이 컸다.")
+    if n_train + n_test < 30:
+        easy += "표본이 30개 미만이라 결과는 탐색적으로만 해석하세요."
+        items.append("표본 수가 적어(30개 미만) 결과는 탐색적으로 해석하여야 한다.")
+    return easy, report_lines(f"{tgt} 예측 머신러닝 결과", items)
+
+
+# ---------------------------------------------------------------- 설문 해석 문장
+# 설문은 빈도·평균만으로는 '유의하다'고 쓰지 않는다. '유의'는 실제 검정(카이제곱·t·ANOVA)에만 쓴다.
+def _svy_small_n(n):
+    return f"응답자 수가 {n}명으로 적어 결과 해석에 주의가 필요하다." if n and n < 30 else ""
+
+
+def _svy_choice_line(col, tbl, cnt_col, pct_col, cat_col=None):
+    """객관식 한 문항: 최다 응답, 쏠림 정도."""
+    cat_col = cat_col or tbl.columns[0]
+    if tbl.empty:
+        return ""
+    t = tbl.sort_values(cnt_col, ascending=False)
+    top, top_p = str(t.iloc[0][cat_col]), float(t.iloc[0][pct_col])
+    sec_p = float(t.iloc[1][pct_col]) if len(t) >= 2 else 0.0
+    ties = [str(x) for x, pp in zip(t[cat_col], t[pct_col]) if abs(float(pp) - top_p) < 1e-9]
+    if len(ties) >= 2:   # 1위가 여럿이면 '가장 많았다'고 하나만 고르지 않는다
+        line = (f"{col}{_josa(col, '은/는')} " + ", ".join(f"'{x}'" for x in ties)
+                + f"{_josa(ties[-1], '이/가')} 각각 {top_p:.1f}%로 같았다")
+        return line + "."
+    line = f"{col}{_josa(col, '은/는')} '{top}'{_josa(top, '이/가')} {top_p:.1f}%로 가장 많았"
+    if len(t) >= 2:
+        sec = str(t.iloc[1][cat_col])
+        line += f"고, 다음은 '{sec}'({sec_p:.1f}%)였"
+    line += "다"
+    if top_p >= 50 and top_p - sec_p >= 20:
+        line += "(응답이 한쪽으로 크게 쏠림)"
+    elif len(t) >= 3 and top_p - float(t.iloc[-1][pct_col]) < 15:
+        line += "(응답이 비교적 고르게 분포)"
+    return line + "."
+
+
+def interp_likert(summ, pos_col, a_, lvl, n_resp, scale_max, cmp_df=None):
+    """리커트 → (쉬운 해석, 보고서 문장)."""
+    v = summ.dropna(subset=["평균"])
+    if v.empty:
+        return "유효한 응답이 있는 문항이 없습니다.", report_lines("리커트 척도 분석 결과", ["유효한 응답이 없었다."])
+    top, low = v.loc[v["평균"].idxmax()], v.loc[v["평균"].idxmin()]
+    mean_all = float(v["평균"].mean())
+    pos_all = float(v[pos_col].mean()) if pos_col in v else np.nan
+    a_txt = f"{a_:.3f}" if a_ is not None and np.isfinite(a_) else "-"
+    easy = (f"{len(v)}개 문항의 평균은 {mean_all:.2f}점({scale_max}점 만점)이고, 긍정 응답은 평균 {pos_all:.1f}%입니다. "
+            f"가장 높은 문항은 '{top['문항']}'({top['평균']:.2f}점), 가장 낮은 문항은 '{low['문항']}'({low['평균']:.2f}점)입니다. "
+            f"신뢰도(크론바흐 α)는 {a_txt}({lvl})입니다.")
+    items = [f"{len(v)}개 문항의 전체 평균은 {mean_all:.2f}점({scale_max}점 척도)이었으며, "
+             f"긍정 응답 비율은 평균 {pos_all:.1f}%였다.",
+             f"평균이 가장 높은 문항은 '{top['문항']}'({top['평균']:.2f}점, 긍정 {float(top[pos_col]):.1f}%), "
+             f"가장 낮은 문항은 '{low['문항']}'({low['평균']:.2f}점, 긍정 {float(low[pos_col]):.1f}%)"
+             f"{_josa(low['문항'], '이었/였')}다.",
+             f"문항 간 내적 일관성(크론바흐 α)은 {a_txt}{_josa(a_txt, '으로/로')} {lvl} 수준이었다."]
+    if cmp_df is not None and len(cmp_df) and "유의성" in cmp_df:
+        sig = cmp_df[cmp_df["유의성"] == "*"]
+        if len(sig):
+            items.append("응답자 특성에 따른 차이 검정 결과 "
+                         + ", ".join(f"{r['특성']}에 따른 '{r['문항']}'" for _, r in sig.head(4).iterrows())
+                         + (f" 등 {len(sig)}개 항목" if len(sig) > 4 else "") + "에서 유의한 차이가 있었다(p<0.05).")
+        else:
+            items.append("응답자 특성에 따른 유의한 차이는 없었다(p≥0.05).")
+    sn = _svy_small_n(n_resp)
+    if sn:
+        items.append(sn)
+        easy += " " + sn.replace("필요하다.", "필요합니다.")
+    return easy, report_lines("리커트 척도 분석 결과", items)
+
+
+def interp_mc(res, n_total=None):
+    """객관식(단일선택) → (쉬운 해석, 보고서 문장). res: 문항, 응답, 빈도, 비율(%)."""
+    items = []
+    for q, g in res.groupby("문항", sort=False):
+        line = _svy_choice_line(str(q), g, "빈도", "비율(%)", "응답")
+        if line:
+            items.append(line)
+    easy = items[0].replace("많았다", "많았습니다").replace("였다", "였습니다") if items else ""
+    if len(items) > 1:
+        easy += f" (그 밖의 {len(items) - 1}개 문항은 보고서용 문장을 참고하세요.)"
+    sn = _svy_small_n(n_total)
+    if sn:
+        items.append(sn)
+    return easy, report_lines("객관식 문항 응답 결과", items)
+
+
+def interp_mr(col, t, n_resp):
+    """다중응답 → (쉬운 해석, 보고서 문장). t: 응답 항목, 응답 수, 응답률(%)."""
+    if t.empty:
+        return "", report_lines(f"{col} 다중응답 결과", ["응답이 없었다."])
+    tops = [f"'{r['응답 항목']}'({float(r['응답률(%)']):.1f}%)" for _, r in t.head(3).iterrows()]
+    avg = float(t["응답 수"].sum()) / max(n_resp, 1)
+    easy = (f"가장 많이 선택된 항목은 {', '.join(tops)} 순이며, 응답자 1명이 평균 {avg:.1f}개를 골랐습니다. "
+            "여러 개를 고를 수 있어 응답률 합계가 100%를 넘는 것은 정상입니다.")
+    items = [f"{col}(복수응답)에서는 {', '.join(tops)} 순으로 많이 선택되었다(응답자 {n_resp}명, 1인 평균 {avg:.1f}개).",
+             "응답률은 응답자 수 대비 비율이므로 합계가 100%를 넘는다."]
+    sn = _svy_small_n(n_resp)
+    if sn:
+        items.append(sn)
+    return easy, report_lines(f"{col} 다중응답 결과", items)
+
+
+def _top_words(texts, k=5):
+    """주관식 응답에서 자주 나온 낱말(2글자 이상, 흔한 조사·어미 제거)."""
+    stop = {"있음", "없음", "합니다", "있습니다", "없습니다", "좋겠습니다", "좋겠음", "너무", "조금", "그리고",
+            "하지만", "같습니다", "생각합니다", "필요합니다", "있으면", "했으면", "에서", "으로", "에게"}
+    cnt = Counter()
+    for t in texts:
+        for w in re.findall(r"[가-힣A-Za-z]{2,}", str(t)):
+            # '편리했으면'·'추가해주세요' 같은 서술어는 주제어가 아니므로 뺀다
+            if re.search(r"(으면|습니다|합니다|좋겠|해요|주세요|했음|됩니다|되면|어요|아요|네요|겠음)$", w):
+                continue
+            w = re.sub(r"(은|는|이|가|을|를|의|에|도|로|으로|과|와|에서|하고|해서|하면|입니다)$", "", w)
+            if len(w) >= 2 and w not in stop:
+                cnt[w] += 1
+    return [w for w, c in cnt.most_common(k) if c >= 2]
+
+
+def interp_text(col, n_total, texts):
+    """주관식 → (쉬운 해석, 보고서 문장)."""
+    n = len(texts)
+    rate = n / max(n_total, 1) * 100
+    words = _top_words(texts)
+    easy = f"'{col}' 문항에는 전체 {n_total}명 중 {n}명({rate:.1f}%)이 의견을 적었습니다."
+    items = [f"{col} 문항에는 전체 {n_total}명 중 {n}명({rate:.1f}%)이 의견을 제시하였다."]
+    if words:
+        easy += " 자주 나온 낱말은 " + ", ".join(f"'{w}'" for w in words) + "입니다."
+        items.append("자주 언급된 낱말은 " + ", ".join(words) + " 등이었다.")
+    return easy, report_lines(f"{col} 주관식 의견", items)
+
+
+def interp_crosstab(rowv, colv, ct, chi2=None, p=None, dof=None, low_pct=None):
+    """교차분석 → (쉬운 해석, 보고서 문장). 유의할 때만 두드러진 칸(행 기준 비율)을 짚는다."""
+    n = int(ct.values.sum())
+    items, easy = [], ""
+    if p is None or not np.isfinite(p):
+        items.append(f"{rowv}{_josa(rowv, '과/와')} {colv}의 교차표를 작성하였다(n={n}).")
+        easy = "교차표를 만들었습니다(카이제곱 검정은 할 수 없었습니다)."
+    else:
+        sig = p < .05
+        items.append(f"{rowv}에 따른 {colv}의 분포 차이를 카이제곱 검정한 결과 "
+                     + ("유의하였다" if sig else "유의하지 않았다")
+                     + f"(χ²={chi2:.2f}, 자유도 {dof}, {_ptxt(p, 4)}).")
+        easy = (f"'{rowv}'에 따라 '{colv}' 응답 분포가 "
+                + ("통계적으로 다릅니다" if sig else "통계적으로 다르다고 보기 어렵습니다")
+                + f"(χ²={chi2:.2f}, {_ptxt(p, 4)}). ")
+        if sig:
+            rp = ct.div(ct.sum(axis=1).replace(0, np.nan), axis=0) * 100
+            fixed = []
+            for r in rp.index:
+                c_ = rp.loc[r].idxmax()
+                fixed.append(f"{r}{_josa(r, '은/는')} '{c_}'({rp.loc[r, c_]:.1f}%)")
+            items.append("집단별로 가장 많은 응답은 " + ", ".join(fixed[:6]) + "였다.")
+            easy += "집단별 최다 응답: " + ", ".join(fixed[:4]) + "."
+    if low_pct is not None and low_pct > 20:
+        items.append(f"기대빈도 5 미만인 칸이 {low_pct:.0f}%로 많아 결과 해석에 주의가 필요하다.")
+    sn = _svy_small_n(n)
+    if sn:
+        items.append(sn)
+    return easy, report_lines(f"{rowv}×{colv} 교차분석 결과", items)
+
+
+def interp_survey_auto(rep_blocks, n_total, pos_col=None, a_=None, lvl=None, scale_max=None, likert_summ=None):
+    """자동 인식 → 유형별 핵심 결과를 모은 종합 (쉬운 해석, 보고서 문장)."""
+    items = [f"총 {n_total}명의 응답을 문항 유형별로 분석하였다."]
+    for b in rep_blocks:
+        cap, tb = str(b.get("caption", "")), b.get("table")
+        if tb is None or not len(tb):
+            continue
+        name = cap.split(" - ", 1)[-1]
+        if cap.startswith(("응답자 특성 - ", "문항 응답 - ")) and "빈도(명)" in tb:
+            ln = _svy_choice_line(name, tb, "빈도(명)", "비율(%)")
+            if ln:
+                items.append(("응답자 " if cap.startswith("응답자") else "") + ln)
+        elif cap.startswith("다중응답 - ") and "응답률(%)" in tb:
+            tops = ", ".join(f"'{r['응답 항목']}'({float(r['응답률(%)']):.1f}%)" for _, r in tb.head(3).iterrows())
+            items.append(f"{name}(복수응답)은 {tops} 순으로 많이 선택되었다.")
+        elif cap.startswith("주관식 의견 - "):
+            items.append(f"{name} 문항에는 {len(tb)}건의 의견이 제시되었다.")
+    if likert_summ is not None and len(likert_summ.dropna(subset=["평균"])):
+        _, lk = interp_likert(likert_summ, pos_col, a_, lvl, n_total, scale_max)
+        items += [ln[4:] for ln in lk.split("\n")[1:]]
+    sn = _svy_small_n(n_total)
+    if sn and sn not in items:
+        items.append(sn)
+    easy = items[1] if len(items) > 1 else items[0]
+    if len(items) > 2:
+        easy += f" 외 {len(items) - 2}개 결과는 보고서용 문장을 참고하세요."
+    return easy, report_lines("설문조사 분석 결과", items)
+
 
 def report_sentence_anova(gc, vc, pval, means, letters, ci=None, ph=""):
     """시험연구보고서 양식(○ / -)의 결과 문장 자동 작성"""
     order = means.sort_values("mean", ascending=False).index.tolist()
     top, low = order[0], order[-1]
     lines = [f"○ {gc}별 {vc} 분석 결과"]
-    lines.append(f"  - {top}{_josa(top)} {means.loc[top,'mean']:.1f}로 가장 높았고, "
-                 f"{low}{_josa(low)} {means.loc[low,'mean']:.1f}로 가장 낮았다.")
+    _tv, _lv = f"{means.loc[top,'mean']:.1f}", f"{means.loc[low,'mean']:.1f}"
+    lines.append(f"  - {top}{_josa(top)} {_tv}{_josa(_tv, '으로/로')} 가장 높았고, "
+                 f"{low}{_josa(low)} {_lv}{_josa(_lv, '으로/로')} 가장 낮았다.")
     if pval < 0.05:
-        lines.append(f"  - 처리 간 유의한 차이가 인정되었다(p={pval:.4f}).")
+        lines.append(f"  - 처리 간 유의한 차이가 인정되었다({_ptxt(pval, 4)}).")
         by = {}
         for g, l in letters.items(): by.setdefault(l, []).append(str(g))
         same = [v for v in by.values() if len(v) > 1]
@@ -4371,18 +5218,18 @@ def report_sentence_anova(gc, vc, pval, means, letters, ci=None, ph=""):
             lines.append(f"  - 다만 {_grp}{_josa(same[0][-1], '은/는')} 같은 문자군에 속하여 "
                          "통계적으로 동등한 수준이었다.")
     else:
-        lines.append(f"  - 처리 간 유의한 차이는 인정되지 않았다(p={pval:.4f}).")
+        lines.append(f"  - 처리 간 유의한 차이는 인정되지 않았다({_ptxt(pval, 4)}).")
     if ci and not np.isnan(ci.get("CV", np.nan)):
         lines.append(f"  - 시험의 변이계수(CV)는 {ci['CV']:.1f}%로 "
                      f"{cv_grade(ci['CV'])} 수준이었다.")
     if ph:
-        lines.append(f"  - 평균 간 비교는 {ph}(p<0.05)으로 실시하였다.")
+        lines.append(f"  - 평균 간 비교는 {ph}(p<0.05){_josa(ph, '으로/로')} 실시하였다.")
     return "\n".join(lines)
 
 def interpret_anova(pval, letters):
     if pval < 0.001: s = "처리구 간 **매우 뚜렷한 차이**가 있습니다 (p < 0.001)."
-    elif pval < 0.05: s = f"처리구 간 **통계적으로 유의한 차이**가 있습니다 (p = {pval:.3f})."
-    else: return f"처리구 간 유의한 차이가 **없습니다** (p = {pval:.3f} ≥ 0.05)."
+    elif pval < 0.05: s = f"처리구 간 **통계적으로 유의한 차이**가 있습니다 ({_ptxt(pval, 3, spaced=True)})."
+    else: return f"처리구 간 유의한 차이가 **없습니다** ({_ptxt(pval, 3, spaced=True)} ≥ 0.05)."
     by = {}
     for g, l in letters.items(): by.setdefault(l, []).append(g)
     same = [v for v in by.values() if len(v) > 1]
@@ -4399,7 +5246,7 @@ def interpret_corr(corr, sel):
     s = "강한" if abs(r) >= 0.7 else ("뚜렷한" if abs(r) >= 0.4 else "약한")
     d = "양(+)의" if r > 0 else "음(-)의"
     t = "한 변수가 커질수록 다른 변수도 커집니다." if r > 0 else "한 변수가 커질수록 다른 변수는 작아집니다."
-    return f"가장 관계가 큰 변수는 **'{a}'와 '{b}'** 로, {s} {d} 상관입니다 (r = {r:.2f}). {t}"
+    return f"가장 관계가 큰 변수는 **'{a}'{_josa(a, '과/와')} '{b}'** 로, {s} {d} 상관입니다 (r = {r:.2f}). {t}"
 
 EXPLAIN = {
 "sd_se": """둘 다 '±' 뒤에 붙는 값이지만 **뜻이 완전히 다릅니다.**
@@ -4759,6 +5606,442 @@ def make_sample(kind):
         return pd.DataFrame(rows)
     return pd.DataFrame()
 
+# ================================================================ 데이터 점검 (버전1에서 옮겨 옴)
+# 올린 자료를 점검해 '무엇이 · 어디서(엑셀 행) · 어떻게 고치는지'를 알려 준다.
+# 점검 자체는 자료를 바꾸지 않는다. 요약 행·빈 행 빼기는 사용자가 버튼을 눌렀을 때만(원클릭은 자동) 한다.
+# 'CV(%)', 'LSD(0.05)', 'C.V.(%)', '평균(Mean)'처럼 뒤에 괄호·숫자가 붙은 경우도 포함
+_SUMMARY_ROW_RE = re.compile(r"^\s*(평균|합계|총계|소계|계|표준편차|표준오차|변이계수|c\.?v\.?|lsd|dmrt|total|sum|mean|average|avg|sd|se|s\.e\.?)"
+                             r"\s*(\([^)]{0,12}\)|[\d.%]{1,6})?\s*$", re.I)
+# '대조구 평균', '처리1 합계', '평균(대조구)'처럼 처리명이 붙은 요약 행
+_SUMMARY_SUFFIX_RE = re.compile(r"^\s*(?:(.{1,20}?)[\s(\[]*(평균|합계|총계|소계)[)\]]?|(평균|합계|소계)\s*[(\[](.{1,20})[)\]])\s*$")
+
+
+def _is_summary_label(v):
+    """'평균'·'합계'처럼 그 자체가 요약 행 이름인지 (처리명이 붙은 경우 포함)."""
+    return isinstance(v, str) and bool(_SUMMARY_ROW_RE.match(v) or _SUMMARY_SUFFIX_RE.match(v))
+
+
+_SUMMARY_BASE_WORDS = {"전체", "총", "처리", "처리구", "시험구", "전 처리", "전체 처리"}
+
+
+def summary_row_positions(data):
+    """평균·합계·표준편차 같은 요약 행의 위치(0부터) 목록.
+
+    - '평균', '합계', 'LSD'처럼 단어만 있으면 요약 행으로 본다.
+    - '대조구 평균'처럼 이름이 붙은 경우는 잘못 빼지 않도록, 앞 이름(대조구)이 같은 열에
+      실제로 있거나('전체 평균'처럼) 전체를 뜻하는 말이거나, 그 행의 반복(블록) 칸이
+      비어 있을 때만 요약 행으로 본다. ('가중평균' 같은 처리명이나 설문 주관식 답을 빼지 않기 위함)
+    """
+    if data is None or getattr(data, "empty", True):
+        return []
+    obj_cols = [c for c in data.columns if not pd.api.types.is_numeric_dtype(data[c])]
+    if not obj_cols:
+        return []
+    blk_cols = [c for c in data.columns if any(k in str(c).lower() for k in _BLOCK_KEYS)]
+    hits = set()
+    for c in obj_cols:
+        ser = data[c].reset_index(drop=True)
+        cand = ser[ser.map(lambda v: isinstance(v, str) and bool(_SUMMARY_ROW_RE.match(v)
+                                                                 or _SUMMARY_SUFFIX_RE.match(v)))]
+        if cand.empty:
+            continue
+        vals = None
+        for pos, v in cand.items():
+            if pos in hits:
+                continue
+            mm = _SUMMARY_ROW_RE.match(v)
+            if mm:
+                # 'SE'·'Mean'처럼 영문 약어는 품종·계통 이름일 수도 있어, 한 번만 나오거나 반복 칸이 빈 행만 본다.
+                if re.fullmatch(r"[A-Za-z.]+", mm.group(1)):
+                    if (ser == v).sum() > 1 and not any(pd.isna(data[b].iloc[pos]) for b in blk_cols if b != c):
+                        continue
+                hits.add(pos)
+                continue
+            m = _SUMMARY_SUFFIX_RE.match(v)
+            base = (m.group(1) or m.group(4) or "").strip(" ()[]")
+            if vals is None:
+                vals = set(ser.dropna().astype(str).str.strip())
+            blank_blk = any(pd.isna(data[b].iloc[pos]) for b in blk_cols if b != c)
+            if (base and base != v.strip() and (base in vals or base in _SUMMARY_BASE_WORDS)) or blank_blk:
+                hits.add(pos)
+    return sorted(hits)
+
+
+def find_summary_rows(data):
+    """요약 행의 인덱스(행 이름) 목록."""
+    return [data.index[p] for p in summary_row_positions(data)]
+
+
+def blank_row_positions(data):
+    """모든 칸이 빈 행(엑셀 표 중간의 빈 줄)의 위치 목록."""
+    if data is None or getattr(data, "empty", True):
+        return []
+    return [int(p) for p in np.flatnonzero(data.isna().all(axis=1).to_numpy())]
+
+
+def find_blank_rows(data):
+    return [data.index[p] for p in blank_row_positions(data)]
+
+
+def drop_row_positions(data, positions):
+    """위치로 행을 뺀다(행 이름이 겹쳐도 정확히 그 행만 빠진다)."""
+    keep = np.ones(len(data), dtype=bool)
+    keep[list(positions)] = False
+    return data[keep]
+
+
+_CK_NUM_WITH_UNIT_RE = re.compile(r"^\s*[-+]?\d[\d,]*(\.\d+)?\s*[A-Za-z가-힣%㎡㎏℃/().·]{0,8}\s*$")
+_CK_PURE_NUM_RE = re.compile(r"^\s*[-+]?(\d[\d,]*)?(\.\d+)?\s*$")
+
+
+def _ck_numeric_like(data, min_ratio=0.6):
+    """'숫자+단위'(120kg, 1,200) 위주로 채워진 문자 열만 찾는다. 반환: {열: 숫자로 볼 수 있는 비율(%)}
+
+    값이 숫자로 시작하는 경우만 인정하고, '1차·2회·3반복'처럼 순서·구분 값과
+    '30대·5년 이상' 같은 설문 구간, 처리·반복·조사시기 열은 측정값으로 보지 않는다.
+    """
+    out = {}
+    for c in data.columns:
+        if pd.api.types.is_numeric_dtype(data[c]):
+            continue
+        ser = data[c].dropna().astype(str).str.strip()
+        ser = ser[ser != ""]
+        if ser.empty:
+            continue
+        ok = ser.str.match(_CK_NUM_WITH_UNIT_RE)
+        if ok.mean() < min_ratio:
+            continue
+        if ser[ok].str.contains(r"\d\s*(?:차|회|번|구|호|기|주차|반복|시기|년차)\s*$", regex=True).mean() >= 0.8:
+            continue
+        if ser.str.contains(r"\d\s*(?:대|세|살|년|개월)\s*(?:이하|이상|미만|초과|전후)?\s*$", regex=True).mean() >= 0.8:
+            continue
+        name = str(c).lower()
+        if any(k in name for k in _BLOCK_KEYS + _TRT_KEYS + ["시기", "일자", "차수", "조사"]):
+            continue
+        out[c] = round(float(ok.mean()) * 100, 1)
+    return out
+
+
+def _ck_row_labels(data, idx_list, limit=5):
+    """행 위치를 사용자가 엑셀에서 찾을 수 있는 번호로 바꾼다 (머리글 행 수 반영)."""
+    idx_list = list(idx_list)
+    hdr = int(st.session_state.get("hdr_rows", 1) or 1)
+    simple = isinstance(data.index, pd.RangeIndex) and data.index.start == 0 and data.index.step == 1
+    labs = [f"{int(i) + 1 + hdr}행" if simple else f"{i}번 행" for i in idx_list[:limit]]
+    more = f" 외 {len(idx_list) - limit}곳" if len(idx_list) > limit else ""
+    return ", ".join(labs) + more
+
+
+def _ck_suspicious_values(data, trt, ys, max_cols=30):
+    """처리구 안에서 혼자 크게 튀는 값(소수점·자릿수 입력 실수 의심).
+
+    같은 처리구의 나머지 값들과 비교해 ① 5배 이상 크거나 1/5 이하이고 ② 나머지 값들의
+    범위보다 10배 넘게 떨어져 있을 때만 알린다. 병 발생률처럼 0 근처 값이 섞인 자료에서
+    잘못 알리지 않도록 두 조건을 모두 본다. 반환: [(열, 인덱스, 값, 처리, 나머지 중앙값)]
+    """
+    out = []
+    for y in list(ys)[:max_cols]:
+        if y not in data.columns or not pd.api.types.is_numeric_dtype(data[y]):
+            continue
+        for g, sub in data[[trt, y]].dropna().groupby(trt):
+            s = sub[y]
+            if len(s) < 3:
+                continue
+            arr = s.to_numpy(dtype=float)
+            for j, (i, x) in enumerate(zip(s.index, arr)):
+                rest = np.delete(arr, j)
+                med = float(np.median(rest))
+                spread = float(rest.max() - rest.min())
+                if med <= 0 or x <= 0:
+                    continue
+                ratio = float(x) / med
+                if (ratio >= 5 or ratio <= 0.2) and abs(float(x) - med) > 10 * max(spread, abs(med) * 1e-9):
+                    out.append((y, i, float(x), g, med))
+    return out
+
+
+def data_checkup(data):
+    """업로드한 자료를 점검한다.
+
+    반환: [{"level": "error|warn|info|ok", "title": str, "detail": str, "fix": str}, ...]
+    분석 결과에는 영향을 주지 않는 읽기 전용 점검이다.
+    """
+    out = []
+
+    def add(level, title, detail="", fix=""):
+        out.append({"level": level, "title": title, "detail": detail, "fix": fix})
+
+    if data is None or getattr(data, "empty", True):
+        add("error", "데이터가 비어 있습니다.", "", "파일에 값이 들어 있는지 확인해 주세요.")
+        return out
+    cols = [str(c) for c in data.columns]
+    add("ok", f"{len(data):,}행 × {len(cols)}열을 읽었습니다.")
+
+    # 1) 머리글(첫 행) 문제
+    blank_hdr = [c for c in cols if re.fullmatch(r"열(_\d+)?", c)]
+    num_hdr = [c for c in cols if re.fullmatch(r"-?\d+(\.\d+)?", c.strip())]
+    if len(cols) < 2:
+        add("error", "열이 1개뿐입니다.",
+            "처리구·반복·측정값이 한 칸에 합쳐져 있거나, 구분 기호가 맞지 않는 CSV일 수 있습니다.",
+            "처리구, 반복, 측정값을 각각 다른 열로 나눠 주세요.")
+    if blank_hdr and len(blank_hdr) >= max(1, len(cols) // 2):
+        add("error", "첫 행이 변수명이 아닌 것 같습니다.",
+            f"이름 없는 열이 {len(blank_hdr)}개 있습니다. 표 위에 제목 행이 있거나 머리글이 병합셀일 가능성이 큽니다.",
+            "엑셀에서 제목·빈 행을 지우고 **첫 행에 변수명만** 남겨 주세요. 머리글이 두 줄이면 "
+            "📂 데이터 불러오기의 '머리글(변수명) 행 수'를 2로 바꿔 주세요.")
+    elif blank_hdr:
+        add("warn", f"이름 없는 열: {', '.join(blank_hdr)}",
+            "머리글 칸이 비어 있는 열입니다.", "엑셀에서 해당 열의 첫 칸에 변수명을 적어 주세요.")
+    if num_hdr and len(num_hdr) >= max(2, len(cols) // 2):
+        add("error", "변수명 대신 숫자가 머리글로 읽혔습니다.",
+            f"머리글: {', '.join(num_hdr[:6])}",
+            "첫 행에 `처리구`, `반복`, `수량(kg/10a)`처럼 변수명을 넣어 주세요.")
+
+    # 2) 숫자 열에 섞인 문자(단위·메모·유의성 문자)
+    numlike = _ck_numeric_like(data)
+    for c, ratio in numlike.items():
+        txt = data[c].dropna().astype(str).str.strip()
+        bad = txt[~txt.str.match(_CK_PURE_NUM_RE) | (txt == "")]
+        examples = ", ".join(f"{_ck_row_labels(data, [i])} '{v}'" for i, v in list(bad.items())[:3])
+        add("warn", f"'{c}' 열에 숫자가 아닌 값이 섞여 있습니다.",
+            (f"{len(bad)}칸: {examples}" + (" …" if len(bad) > 3 else "")) if len(bad) else
+            "숫자가 문자 형식으로 저장되어 있습니다.",
+            "숫자 칸에는 숫자만 적고 단위는 열 이름에 적어 주세요 (`120kg` ❌ → `120` ✅). "
+            "아래 '🔧 숫자로 자동 변환'으로 바로 고칠 수도 있습니다.")
+
+    # 3) 평균·합계 같은 요약 행 / 완전히 빈 행
+    sum_rows = find_summary_rows(data)
+    if sum_rows:
+        add("error", "평균·합계 같은 요약 행이 들어 있습니다.", _ck_row_labels(data, sum_rows),
+            "요약 행이 섞이면 그 행도 하나의 처리로 계산됩니다. 아래 **🧹 요약 행 빼기** 버튼을 누르거나, "
+            "엑셀에서 해당 행을 지우고 원자료만 남겨 주세요. (평균은 앱이 계산합니다)")
+    blank_rows = find_blank_rows(data)
+    if blank_rows:
+        add("warn", f"모든 칸이 빈 행이 {len(blank_rows)}개 있습니다.", _ck_row_labels(data, blank_rows),
+            "표 중간의 빈 줄입니다. 아래 **🧹 빈 행 빼기** 버튼으로 뺄 수 있습니다.")
+
+    # 4) 빈칸 (빈 행·요약 행은 위에서 따로 알렸으므로 뺀다)
+    _rest = drop_row_positions(data, set(summary_row_positions(data)) | set(blank_row_positions(data)))
+    miss = _rest.isna().sum()
+    miss = miss[miss > 0]
+    if len(miss):
+        parts = []
+        for c, n in miss.items():
+            rows = _rest.index[_rest[c].isna()]
+            parts.append(f"'{c}' {int(n)}칸({_ck_row_labels(data, rows, 3)})")
+        add("warn", f"빈칸(결측) {int(miss.sum())}개가 있습니다.", " / ".join(parts[:4]) + (" …" if len(parts) > 4 else ""),
+            "조사를 안 한 값이면 빈칸 그대로 두어도 됩니다. 입력을 빠뜨린 것이면 채워 주세요. "
+            "'결측', '-', '없음' 같은 글자는 넣지 말고 빈칸으로 두세요.")
+
+    # 5) 같은 처리명인데 띄어쓰기·대소문자만 다른 경우
+    obj_cols = [c for c in data.columns if not pd.api.types.is_numeric_dtype(data[c])]
+    for c in obj_cols:
+        vals = data[c].dropna().astype(str)
+        if vals.nunique() > 50:
+            continue
+        groups = {}
+        for v in vals.unique():
+            groups.setdefault(re.sub(r"\s+", "", v).lower(), []).append(v)
+        clash = [g for g in groups.values() if len(g) > 1]
+        if clash:
+            show = "; ".join(" / ".join(f"'{x}'" for x in g) for g in clash[:3])
+            add("warn", f"'{c}' 열에 같은 이름이 다르게 적힌 값이 있습니다.", show,
+                "띄어쓰기·대소문자가 다르면 서로 다른 처리로 계산됩니다. 한 가지로 통일해 주세요.")
+
+    # 6) 중복 행 (빈 행끼리 겹치는 것은 위에서 알렸으므로 뺀다)
+    dup = _rest.index[_rest.duplicated()]
+    if len(dup):
+        add("warn", f"완전히 같은 행이 {len(dup)}개 있습니다.", _ck_row_labels(data, dup),
+            "같은 값을 두 번 붙여넣었는지 확인해 주세요. 실제로 같은 값이면 그대로 두어도 됩니다.")
+
+    # 7) 가로로 펼친 자료
+    coltxt = [c.lower() for c in cols]
+    treat_header_hits = [c for c in coltxt if re.search(r"대조|처리\s*\d|처리[가-힣a-z]|품종\s*\d", c)]
+    has_group_col = any(any(k in c for k in ("처리구", "처리", "품종", "그룹", "시험구")) and
+                        not re.search(r"처리\s*\d|처리[가-힣a-z]", c.replace("처리구", "")) for c in coltxt)
+    if len(treat_header_hits) >= 2 and not has_group_col:
+        add("warn", "처리구가 여러 열로 가로로 펼쳐진 형태입니다.",
+            f"열: {', '.join(treat_header_hits[:5])}",
+            "`처리구 / 반복 / 측정값` 세 열로 세로로 입력해 주세요.")
+    repeat_wide = [c for c in coltxt if re.search(r"반복\s*[1-9]|rep\s*[1-9]", c)]
+    if len(repeat_wide) >= 2:
+        add("warn", "반복이 여러 열로 나뉘어 있습니다.", f"열: {', '.join(repeat_wide[:5])}",
+            "`반복` 열 하나에 1, 2, 3을 세로로 입력해 주세요.")
+
+    # 8) 실험설계 · 반복 수 (요약 행·빈 행은 빼고 본다)
+    if len(_rest) < 3:
+        add("warn", "행이 3개 미만입니다.", "", "대부분의 통계검정에는 관측값이 더 필요합니다.")
+    try:
+        dsg = detect_design(_rest)
+    except Exception:
+        dsg = {}
+    trt, blk = dsg.get("trt"), dsg.get("blk")
+    if trt:
+        cnt = _rest[trt].value_counts(dropna=True)
+        add("ok", f"처리(그룹) 열: '{trt}' — {len(cnt)}개 처리"
+            + (f", 반복(블록) 열: '{blk}'" if blk else ""))
+        ones = [str(k) for k, v in cnt.items() if v < 2]
+        _low_cv = []
+        for _y in (dsg.get("ys") or [])[:30]:
+            try:
+                if _rest[_y].nunique(dropna=True) <= 1:   # 값이 모두 같은 열은 아래 ℹ️에서 따로 알린다
+                    continue
+                _g = _rest.groupby(trt)[_y]
+                _var = _g.var(ddof=1).dropna()
+                _m = float(pd.to_numeric(_rest[_y], errors="coerce").mean())
+                if len(_var) and _m and (_g.count() >= 2).all():
+                    _cvw = float(np.sqrt(_var.mean())) / abs(_m) * 100
+                    if _cvw < 1:
+                        _low_cv.append(f"{_y}(CV {_cvw:.2f}%)")
+            except Exception:
+                pass
+        if _low_cv:
+            add("warn", "반복 간 값이 거의 같습니다.", ", ".join(_low_cv[:5]),
+                "실제 포장시험에서 변이계수(CV) 1% 미만은 거의 나오지 않습니다. 평균값을 반복마다 복사해 넣지 않았는지, "
+                "반복별 **원자료**를 입력했는지 확인해 주세요.")
+        if ones:
+            add("warn", "반복이 1개뿐인 처리가 있습니다.", ", ".join(f"'{o}'" for o in ones[:6]),
+                "처리마다 반복이 2개 이상이어야 처리 간 차이를 검정할 수 있습니다.")
+        elif cnt.nunique() > 1:
+            add("info", "처리마다 반복(관측) 수가 다릅니다.",
+                ", ".join(f"{k} {v}개" for k, v in list(cnt.items())[:6]),
+                "누락된 조사값이 없는지 확인해 주세요. 불균형이어도 분석은 가능합니다.")
+        # 같은 처리·같은 반복이 두 번 나오는 행 — 처리·반복(·부요인) 말고 다른 구분 열이 없을 때만 본다
+        if blk:
+            try:
+                _keys = [k for k in (trt, dsg.get("sub"), blk) if k]
+                _catc = split_code_columns(_rest)[1]
+                if not [c for c in _catc if c not in _keys]:
+                    _sz = _rest.dropna(subset=_keys).groupby(_keys).size()
+                    _dupk = _sz[_sz > 1]
+                    if len(_dupk):
+                        _show = ", ".join(" · ".join(map(str, (k if isinstance(k, tuple) else (k,))))
+                                          + f"({v}행)" for k, v in list(_dupk.items())[:5])
+                        add("warn", "같은 처리·같은 반복이 두 번 이상 나옵니다.", _show,
+                            "반복 번호를 잘못 적었거나 같은 행을 두 번 넣었는지 확인해 주세요. "
+                            "한 반복에서 여러 개체를 조사했다면 정상입니다(분석 시 평균을 내거나 그대로 써도 됩니다).")
+            except Exception:
+                pass
+        # 처리구 안에서 혼자 튀는 값
+        try:
+            _sus = _ck_suspicious_values(_rest, trt, dsg.get("ys") or [])
+        except Exception:
+            _sus = []
+        if _sus:
+            _show = "; ".join(f"'{y}' {_ck_row_labels(data, [i])} {x:g} ({g} 나머지 중앙값 {m:g})"
+                              for y, i, x, g, m in _sus[:4]) + (" …" if len(_sus) > 4 else "")
+            add("warn", "같은 처리구 안에서 혼자 크게 튀는 값이 있습니다.", _show,
+                "소수점 위치나 자릿수를 잘못 적었는지(예: 9.05 → 90.5) 원자료와 대조해 주세요. "
+                "실제 값이면 그대로 두어도 됩니다. 앱이 값을 바꾸지는 않습니다.")
+    elif dsg and numlike:
+        add("info", "측정값 열이 글자로 읽혀 처리·품종 열을 아직 판단하지 못했습니다.", "",
+            "위의 '숫자가 아닌 값' 항목을 고치면(또는 🔧 숫자로 자동 변환) 처리 열도 함께 인식됩니다.")
+    elif dsg:
+        add("info", "처리·품종 열을 찾지 못했습니다.", "",
+            "처리 간 비교를 하려면 `처리구`나 `품종` 열이 필요합니다. 상관·회귀·예측·설문만 할 거라면 없어도 됩니다.")
+    # 숫자로 적힌 처리·반복 코드 열 안내는 📋 데이터 화면에서 따로(ℹ️) 보여 준다.
+
+    # 9) 참고 사항
+    numc = data.select_dtypes(include=np.number).columns
+    neg = [str(c) for c in numc if (data[c] < 0).any()]
+    if neg:
+        add("info", f"음수가 있는 열: {', '.join(neg)}", "", "입력 실수가 아닌지 확인해 주세요.")
+    const = [str(c) for c in data.columns if data[c].nunique(dropna=True) <= 1]
+    if const:
+        add("info", f"값이 모두 같은 열: {', '.join(const)}", "", "이 열은 분석에서 제외됩니다.")
+    return out
+
+
+def _ck_upload_sig(name):
+    """불러온 원본(files[name])의 내용 서명 — 전처리로 바뀐 df가 아니라 올린 파일 자체를 기준으로 한다."""
+    try:
+        d = (st.session_state.get("files") or {}).get(name)
+        return hash(dataframe_signature(d)) if d is not None else None
+    except Exception:
+        return None
+
+
+def checkup_for(data):
+    """점검 결과를 데이터가 바뀔 때만 다시 계산한다."""
+    if data is None:
+        return data_checkup(data)
+    try:
+        key = (dataframe_signature(data), int(st.session_state.get("hdr_rows", 1) or 1))
+    except Exception:
+        return data_checkup(data)
+    cache = st.session_state.setdefault("_checkup_cache", {})
+    if key not in cache:
+        if len(cache) >= 6:
+            cache.pop(next(iter(cache)))
+        try:
+            cache[key] = data_checkup(data)
+        except Exception:
+            return [{"level": "ok", "title": "자동 점검을 건너뛰었습니다.", "detail": "", "fix": ""}]
+    return cache[key]
+
+
+def checkup_counts(findings):
+    return {lv: sum(1 for f in findings if f["level"] == lv) for lv in ("error", "warn", "info", "ok")}
+
+
+def render_checkup(findings, compact=False):
+    """점검 결과를 '문제 → 위치 → 고치는 법' 순서로 보여 준다."""
+    cnt = checkup_counts(findings)
+    if cnt["error"]:
+        st.error(f"❌ 분석 전에 꼭 고쳐야 할 문제 {cnt['error']}건" + (f", 확인할 항목 {cnt['warn']}건" if cnt["warn"] else ""))
+    elif cnt["warn"]:
+        st.warning(f"⚠️ 분석은 가능하지만 확인할 항목이 {cnt['warn']}건 있습니다.")
+    else:
+        st.success("✅ 데이터가 잘 정리되어 있습니다. 바로 분석할 수 있어요.")
+    icon = {"error": "❌", "warn": "⚠️", "info": "ℹ️"}
+    for f in findings:
+        if f["level"] == "ok" or (compact and f["level"] == "info"):
+            continue
+        body = f"{icon[f['level']]} **{f['title']}**"
+        if f["detail"]:
+            body += f"  \n　📍 {f['detail']}"
+        if f["fix"]:
+            body += f"  \n　🔧 {f['fix']}"
+        st.markdown(body)
+    oks = [f["title"] for f in findings if f["level"] == "ok"]
+    if oks and not compact:
+        st.caption("✔ " + "  ·  ".join(oks))
+
+
+def checkup_fix_buttons(data, key):
+    """요약 행·빈 행이 있으면 빼는 버튼을 보여 준다. 누르면 현재 데이터에서 빼고(실행취소 가능) 다시 그린다."""
+    if data is None:
+        return
+    spos, bpos = summary_row_positions(data), blank_row_positions(data)
+    srows, brows = spos, bpos
+    if not srows and not brows:
+        return
+    rows = sorted(set(spos) | set(bpos))
+    what = " · ".join(([f"요약 행 {len(srows)}개"] if srows else []) + ([f"빈 행 {len(brows)}개"] if brows else []))
+    label = "🧹 " + ("요약 행·빈 행 빼기" if srows and brows else "요약 행 빼기" if srows else "빈 행 빼기") + f" ({what})"
+    if srows:
+        st.caption("뺄 요약 행: " + ", ".join(f"'{v}'" for v in
+                   data.iloc[spos].astype(str).apply(lambda r: next((x for x in r if _is_summary_label(x)), r.iloc[0]), axis=1)
+                   .tolist()[:8]) + (" …" if len(srows) > 8 else ""))
+    if st.button(label, key=f"ck_fix_{key}", width="stretch",
+                 help="현재 분석 데이터에서만 뺍니다. 🧹 전처리의 ↩️ 실행취소나 사이드바의 '원본 데이터로 되돌리기'로 되돌릴 수 있습니다."):
+        set_df(drop_row_positions(data, rows), f"{what} 빼기")
+        log_action(f"데이터 점검: {what} 빼기")
+        st.rerun()
+
+
+def summary_rows_notice(data, key):
+    """분석 화면 위에 띄우는 짧은 경고 — 요약 행이 섞여 있으면 바로 뺄 수 있게 한다."""
+    try:
+        srows = find_summary_rows(data)
+    except Exception:
+        srows = []
+    if srows:
+        st.error(f"❌ 평균·합계 같은 요약 행 {len(srows)}개가 섞여 있습니다({_ck_row_labels(data, srows, 3)}). "
+                 "그대로 분석하면 요약 행도 하나의 처리로 계산됩니다.")
+        checkup_fix_buttons(data, key)
+
+
 # ================================================================ 세션
 # 메뉴를 옮겨다녀도 각 화면의 선택 상태가 초기화되지 않도록 붙잡아 둔다.
 # (스트림릿은 화면에 그려지지 않은 위젯의 상태를 자동으로 버린다)
@@ -4783,7 +6066,9 @@ _PIN_GLOBAL_PREFIX = ("hwp_", "sup_", "fig_", "kamis_", "kosis_", "price_",
                       "gen_report", "FormSubmitter", "$$", "uncaught",
                       # 로그인 세션·기기 기억 상태는 데이터(시트)와 무관하다.
                       # 여기서 빠지면 데이터를 불러오거나 시트를 바꿀 때 로그아웃된다.
-                      "auth_", "_auth_", "_ai_remember", "ssa_")
+                      "auth_", "_auth_", "_ai_remember", "ssa_",
+                      # 데이터 점검 결과 캐시·확인 기록은 데이터별 화면 선택이 아니다.
+                      "_checkup")
 
 # ★ 버튼·다운로드버튼 키는 st.session_state 로 값을 써 넣을 수 없다(스트림릿이 막는다).
 #   여기 빠뜨리면 "Values for the widget with key '...' cannot be set using
@@ -4803,6 +6088,8 @@ _PIN_BUTTON_EXACT = {
     "econ_guide_reset", "econ_guide_home", "econ_switch_guide",
     # 로그인(Firebase)에서 추가한 버튼
     "auth_resend_verify",
+    # 데이터 점검 '확인했어요' 버튼
+    "checkup_ack",
 }
 # 버튼뿐 아니라 st.data_editor 도 session_state 로 값을 써 넣을 수 없다.
 # 이 앱의 해당 위젯 전부:
@@ -4817,7 +6104,7 @@ _PIN_BUTTON_PREFIX = ("__btn_", "btn_", "aib_", "aiadd_", "aidel_", "errai_",
                       "pb_gain_", "pb_loss_", "pbd_", "ml_predict", "ml_dl", "ms_plot_dl_",
                       "econ_entry_", "econ_g_",
                       "hwx_", "dcx_", "csv_", "xls_", "gai_",
-                      "svyhwp_", "svyxls_")
+                      "svyhwp_", "svyxls_", "ck_fix_")
 
 # 데이터와 무관하지만 '메뉴 안에서만' 그려지는 위젯들 — 데이터별로 나눌 필요는 없어도
 # 매 실행마다 붙잡아 두지 않으면 다른 메뉴에 다녀올 때 기본값으로 돌아간다.
@@ -4926,15 +6213,22 @@ if _auth_u:
         _auth_logout()
 
 with st.sidebar.expander("📂 데이터 불러오기", expanded=True):
+    # 선택값(내부 값)은 그대로 두고 화면 이름만 바꾼다 — 저장된 선택값·비교문이 깨지지 않는다.
     _input_mode = st.radio("입력 방식", ["📁 Excel/CSV", "📷 이미지/사진", "🎤 음성"],
-                           horizontal=False, key="data_input_mode")
+                           horizontal=False, key="data_input_mode",
+                           format_func=lambda o: "📁 파일 (Excel·CSV·PDF)" if o == "📁 Excel/CSV" else o,
+                           help="파일: 엑셀(xlsx·xls)·CSV·PDF를 올립니다. "
+                                "이미지/사진: 표를 찍은 사진을 AI로 읽습니다. 음성: 말로 값을 입력합니다.")
 
     if _input_mode == "📁 Excel/CSV":
-        ups = st.file_uploader("Excel / CSV 업로드 (여러 개 가능)",
-                               type=["xlsx", "xls", "csv"], accept_multiple_files=True)
+        ups = st.file_uploader("Excel / CSV / PDF 업로드 (여러 개 가능)",
+                               type=["xlsx", "xls", "csv", "pdf"], accept_multiple_files=True,
+                               help="PDF는 한글·엑셀에서 PDF로 저장한 문서의 표를 그대로 꺼냅니다. "
+                                    "스캔·사진 PDF는 AI 표 인식(API 키 필요)으로 읽습니다.")
         hdr_rows = st.radio("↳ 머리글(변수명) 행 수", [1, 2], horizontal=True, key="hdr_rows",
                             help="변수명이 두 줄로 되어 있으면 2를 선택하세요. 두 줄이 합쳐진 이름으로 만들어집니다.")
-        st.caption("엑셀에 시트가 여러 개면 시트별로 나뉘어 들어옵니다. "
+        st.caption("받는 형식: 엑셀(xlsx·xls)·CSV·PDF. "
+                   "엑셀에 시트가 여러 개면 시트별로 나뉘어 들어옵니다. "
                    "값을 바꾸면 올려둔 파일을 **자동으로 다시 읽습니다**(새로고침 불필요).")
         # 머리글 행 수를 바꾸면 이미 올린 파일을 다시 읽어 화면에도 즉시 반영한다.
         _hdr_changed = st.session_state.get("__hdr_prev") not in (None, hdr_rows)
@@ -4943,7 +6237,51 @@ with st.sidebar.expander("📂 데이터 불러오기", expanded=True):
             head = [0, 1] if hdr_rows == 2 else 0
             for uf in ups:
                 try:
-                    if uf.name.endswith(".csv"):
+                    if uf.name.lower().endswith(".pdf"):
+                        # PDF는 표 추출(또는 AI 인식)이 무거우므로 같은 파일은 한 번만 처리한다.
+                        _pdf_sig = (uf.name, getattr(uf, "size", None), getattr(uf, "file_id", None))
+                        _pdf_done = st.session_state.setdefault("_pdf_done", {})
+                        if _pdf_sig in _pdf_done:
+                            continue
+                        _pbytes = uf.getvalue()
+                        with st.spinner(f"'{uf.name}'에서 표를 찾는 중..."):
+                            _tabs, _tpages, _npages = pdf_to_tables(_pbytes)
+                        _added = []
+                        if _tabs:
+                            for _lab, _d in _tabs:
+                                _k = f"{uf.name} – {_lab}" if len(_tabs) > 1 else uf.name
+                                st.session_state.files[_k] = clean_columns(_d)
+                                _added.append(_k)
+                            st.success(f"📄 '{uf.name}'에서 표 {len(_tabs)}개를 불러왔습니다. "
+                                       "📋 데이터 탭에서 값을 확인하고, 필요하면 🧹 전처리에서 고쳐 주세요.")
+                        elif _tpages == 0 or st.session_state.get("api_key"):
+                            # 글자가 없는 PDF(스캔·사진)이거나, 선 없는 표라 칸을 못 나눈 경우
+                            # AI 이미지 표 인식으로 읽는다(API 키 필요).
+                            if not st.session_state.get("api_key"):
+                                st.warning(f"📄 '{uf.name}'{_josa(uf.name, '은/는')} 스캔·사진 PDF라 글자를 바로 읽을 수 없습니다. "
+                                           "아래 '🤖 AI 기능 켜기'에서 API 키를 넣으면 AI가 표를 읽어 드립니다.")
+                                continue   # 키를 넣은 뒤 다시 처리할 수 있게 '완료'로 표시하지 않는다
+                            for _pi, _img in enumerate(pdf_page_images(_pbytes, max_pages=3), start=1):
+                                with st.spinner(f"AI가 '{uf.name}' {_pi}쪽의 표를 읽는 중..."):
+                                    _idf, _iw = image_to_dataframe(_img, "image/png")
+                                if _idf is not None and len(_idf):
+                                    _k = f"{uf.name} – p{_pi} (AI 인식)"
+                                    st.session_state.files[_k] = clean_columns(_idf)
+                                    _added.append(_k)
+                            if _added:
+                                st.warning(f"🤖 '{uf.name}'에서 AI가 읽은 표 {len(_added)}개를 불러왔습니다. "
+                                           "AI 인식 값은 틀릴 수 있으니 📋 데이터 탭에서 원본과 꼭 대조해 주세요."
+                                           + (" (앞 3쪽까지만 읽었습니다)" if _npages > 3 else ""))
+                            else:
+                                st.error(f"'{uf.name}'에서 표를 읽지 못했습니다. 표 부분만 캡처해 '📷 이미지/사진'으로 올려 보세요.")
+                        else:
+                            st.info(f"📄 '{uf.name}'에는 글자는 있지만 칸이 나뉜 표를 찾지 못했습니다(테두리 선이 없는 표). "
+                                    "엑셀(xlsx)·CSV로 올리거나, 아래 '🤖 AI 기능 켜기'에서 API 키를 넣고 다시 올리면 "
+                                    "AI가 표를 읽어 드립니다.")
+                            continue   # 키를 넣은 뒤 다시 처리할 수 있게 '완료'로 표시하지 않는다
+                        _pdf_done[_pdf_sig] = _added
+                        continue
+                    if uf.name.lower().endswith(".csv"):
                         d = None
                         for _enc in ("utf-8-sig", "cp949", "euc-kr", "utf-8"):
                             try:
@@ -4979,6 +6317,9 @@ with st.sidebar.expander("📂 데이터 불러오기", expanded=True):
                             d = d.dropna(axis=1, how="all")
                             key = f"{uf.name} – {sh}" if len(xls.sheet_names) > 1 else uf.name
                             st.session_state.files[key] = clean_columns(d)
+                except ImportError as e:
+                    # 배포 서버에 읽기 부품이 설치되지 않은 경우 — 영어 오류 대신 할 일을 알려 준다.
+                    st.error(_missing_module_msg(uf.name, e))
                 except Exception as e:
                     st.error(f"{uf.name} 읽기 실패: {e}")
             if _hdr_changed:
@@ -5117,6 +6458,23 @@ if st.session_state.files:
             st.session_state.df = st.session_state.files[k].copy()
             st.sidebar.success("원본으로 되돌렸습니다.")
             st.rerun()
+
+    # 데이터 점검 요약 (자세한 내용은 통계분석 → 📋 데이터)
+    try:
+        _ready = checkup_counts(checkup_for(st.session_state.get("df"))) \
+            if st.session_state.get("df") is not None else None
+        if _ready is None:
+            pass
+        elif _ready["error"]:
+            st.sidebar.error(f"❌ 데이터에 고쳐야 할 문제 {_ready['error']}건")
+        elif _ready["warn"]:
+            st.sidebar.warning(f"⚠️ 데이터 점검 {_ready['warn']}건")
+        else:
+            st.sidebar.success("✅ 분석 준비 완료")
+        if _ready is not None:
+            st.sidebar.caption("자세한 내용: 📊 통계분석 → 📋 데이터")
+    except Exception:
+        pass
 
     with st.sidebar.expander("🗑️ 데이터 삭제"):
         dels = st.multiselect("삭제할 데이터 선택", names, key="del_sel")
@@ -5439,6 +6797,18 @@ def deco(ax, title="", ylabel_top=True):
 sup_show = sup_text
 sup_df = sup_display
 
+def _read_csv_any(f, **kw):
+    """한글 엑셀에서 저장한 CSV(cp949)까지 읽는다. utf-8-sig → cp949 → euc-kr → utf-8 순서."""
+    for enc in ("utf-8-sig", "cp949", "euc-kr", "utf-8"):
+        try:
+            f.seek(0)
+            return pd.read_csv(f, encoding=enc, **kw)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    f.seek(0)
+    return pd.read_csv(f, encoding_errors="replace", **kw)
+
+
 def read_uploaded_text(f, limit=12000):
     """업로드 파일에서 텍스트 추출 (txt/csv/xlsx/hwpx/pdf/docx)"""
     name = f.name.lower()
@@ -5446,7 +6816,7 @@ def read_uploaded_text(f, limit=12000):
         if name.endswith((".txt", ".md")):
             return f.getvalue().decode("utf-8", errors="ignore")[:limit]
         if name.endswith(".csv"):
-            return pd.read_csv(f).to_string()[:limit]
+            return _read_csv_any(f).to_string()[:limit]
         if name.endswith((".xlsx", ".xls")):
             return pd.read_excel(f).to_string()[:limit]
         if name.endswith(".hwpx"):
@@ -5600,7 +6970,7 @@ def pie_chart(counts, title, donut=False):
                 fontsize=12, fontweight="bold", color="#444")
     ax.set_title(title, fontsize=11, pad=10, fontweight="bold", color="#333")
     ax.axis("equal")
-    plt.tight_layout()
+    fig.tight_layout()
     return fig
 
 def break_even_qty(fixed_cost, variable_cost_total, qty, price):
@@ -5720,20 +7090,27 @@ def build_stat_method_text(logs, extra=None):
 
     ph = None
     for name, label in [("Tukey", "Tukey의 HSD 검정"), ("던컨", "던컨의 다중검정(DMRT)"),
-                        ("Duncan", "던컨의 다중검정(DMRT)"), ("Bonferroni", "Bonferroni 보정")]:
+                        ("Duncan", "던컨의 다중검정(DMRT)"), ("Bonferroni", "Bonferroni 보정"),
+                        ("던넷", "Dunnett 검정(대조구 대비)"), ("Dunnett", "Dunnett 검정(대조구 대비)")]:
         if name in acts: ph = label; break
 
     s = "모든 자료의 통계분석은 Python의 statsmodels, scipy 라이브러리를 이용하여 수행하였다."
     if used:
-        s += " 분석 방법으로는 " + ", ".join(dict.fromkeys(used)) + "을(를) 적용하였다."
+        _used_txt = ", ".join(dict.fromkeys(used))
+        s += " 분석 방법으로는 " + _used_txt + _josa(_used_txt, "을/를") + " 적용하였다."
     if extra and extra.get("design"):
-        s += f" 시험은 {extra['design']}으로 배치하였다."
+        s += f" 시험은 {extra['design']}{_josa(extra['design'], '으로/로')} 배치하였다."
     if ph:
-        s += f" 처리 평균 간 비교는 {ph}(p<0.05)으로 실시하였다."
+        s += f" 처리 평균 간 비교는 {ph}(p<0.05){_josa(ph, '으로/로')} 실시하였다."
     if extra and extra.get("cv"):
         s += f" 시험의 변이계수(CV)는 {extra['cv']}%였다."
     s += " 유의수준은 5%로 하였다."
     return s
+
+def sentence_lines(text):
+    """화면 표시용: '~다.' 로 끝나는 문장마다 줄을 바꾼다. (보고서 파일에는 원문 한 문단을 쓴다)"""
+    return re.sub(r"(?<=다\.)\s+", "\n", str(text or "")).strip()
+
 
 def build_abstract(items, meta=None):
     """보고서에 담긴 분석 결과를 읽어 '적요(요약)' 초안을 자동 작성"""
@@ -5746,9 +7123,9 @@ def build_abstract(items, meta=None):
         lines.append(f"본 시험은 {purpose}"
                      + ("" if str(purpose).rstrip().endswith(("다.", "다", ".")) else "를 위하여 수행하였다."))
     elif title:
-        lines.append(f"본 시험은 '{title}'을(를) 목적으로 수행하였다.")
+        lines.append(f"본 시험은 '{title}'{_josa(title, '을/를')} 목적으로 수행하였다.")
     if design:
-        lines.append(f"시험은 {design}으로 배치하였다.")
+        lines.append(f"시험은 {design}{_josa(design, '으로/로')} 배치하였다.")
 
     # 담긴 분석에서 유의한 결과 추출
     findings, tables_seen = [], 0
@@ -5768,19 +7145,22 @@ def build_abstract(items, meta=None):
                     _ptag = ""
                     if pd.notna(_pv):
                         try:
-                            _pf = float(_pv)
-                            _ptag = " (p<0.001)" if _pf < 0.001 else f" (p={_pf:.4f})"
+                            # 원클릭 요약표는 p값을 '<0.0001'처럼 글자로 담는다.
+                            _pf = float(str(_pv).strip().lstrip("<"))
+                            _ptag = " (p<0.001)" if _pf < 0.001 else f" ({_ptxt(_pf, 4)})"
                         except Exception:
                             _ptag = ""
-                    findings.append(f"{r['측정 항목']}은 '{r.get('최고 처리구','')}'에서 "
-                                    f"{r.get('최고 평균','')}로 가장 높아" + "||" + _ptag)
+                    _nm, _mx = r['측정 항목'], r.get('최고 평균', '')
+                    findings.append(f"{_nm}{_josa(_nm, '은/는')} '{r.get('최고 처리구','')}'에서 "
+                                    f"{_mx}{_josa(_mx, '으로/로')} 가장 높아" + "||" + _ptag)
             # 평균+유의성형
             elif "유의성" in cols and "평균" in cols:
                 try:
                     top = tb.sort_values("평균", ascending=False).iloc[0]
                     gcol = cols[0]
                     if str(top.get("유의성", "")).strip():
-                        findings.append(f"{gcol} 중 '{top[gcol]}'의 평균이 {top['평균']}로 가장 높아||")
+                        findings.append(f"{gcol} 중 '{top[gcol]}'의 평균이 {top['평균']}"
+                                        f"{_josa(top['평균'], '으로/로')} 가장 높아||")
                 except Exception:
                     pass
             # 경제성형
@@ -5788,7 +7168,8 @@ def build_abstract(items, meta=None):
                 try:
                     top = tb.sort_values("소득", ascending=False).iloc[0]
                     findings.append(f"'{top[cols[0]]}'의 소득이 "
-                                    f"{int(top['소득']):,}원/10a(소득률 {float(top['소득률(%)']):.1f}%)으로 가장 높아||")
+                                    f"{int(top['소득']):,}원/10a(소득률 {float(top['소득률(%)']):.1f}%)"
+                                    f"{_josa('10a', '으로/로')} 가장 높아||")
                 except Exception:
                     pass
             # 증수형
@@ -5796,7 +7177,7 @@ def build_abstract(items, meta=None):
                 try:
                     top = tb.sort_values("소득증가액", ascending=False).iloc[0]
                     if float(top["증수율(%)"]) > 0:
-                        findings.append(f"'{top[cols[0]]}'은 대조구 대비 {top['증수율(%)']}% 증수되어 "
+                        findings.append(f"'{top[cols[0]]}'{_josa(top[cols[0]], '은/는')} 대조구 대비 {top['증수율(%)']}% 증수되어 "
                                         f"소득증가액 {int(top['소득증가액']):,}원/10a을 나타내||")
                 except Exception:
                     pass
@@ -5899,14 +7280,154 @@ _PRICE_DEFAULTS = [
      "농촌진흥청 소득자료집 작목별 경영비 항목 참고"),
 ]
 
+# 예전 판에만 있던 열 — 불러온 표에 남아 있으면 지운다.
+# (갱신일은 표를 만들 때마다 오늘 날짜가 찍혀 실제 갱신일로 오해됐고, 환산식·기준일은
+#  삭제된 KAMIS 자동 조회에서만 쓰던 열이다)
+_PRICE_DB_OBSOLETE_COLS = ("갱신일", "환산식", "기준일")
+
+
 def default_price_db():
-    """⑫ 메타데이터를 모두 포함한 기준단가 표"""
-    import datetime as _dt
-    today = _dt.date.today().isoformat()
+    """⑫ 메타데이터를 포함한 기준단가 표 (자료 시점은 '기준연도'로 확인)"""
     return pd.DataFrame(
         [{"항목": a, "단가": b, "단위": c, "기준연도": d, "출처": e,
-          "조회방식": "기본값", "갱신일": today, "환산식": "", "사용자수정": False}
+          "조회방식": "기본값", "사용자수정": False}
          for a, b, c, d, e in _PRICE_DEFAULTS])
+
+
+# ---------------------------------------------------------------- 경제성 입력 양식
+# 소득분석·부분예산표·신기술(MRR) 모두 같은 '한 줄 = 처리구 × 반복' 원자료를 쓴다.
+# 비목 이름은 모두 '~비'로 끝나게 해 경영비 열로 자동 선택되고, 임차비는 토지/농기계를
+# 이름으로 나눠 비용 분류(토지 임차료·농기계 임차료)도 자동으로 맞게 잡히게 한다.
+_ECON_TEMPLATE_COLS = [
+    ("처리구", "비교할 처리·품종·기술 이름", "대조구, 신기술"),
+    ("반복", "같은 처리의 반복 번호", "1, 2, 3"),
+    ("조사면적(a)", "이 행의 수량·비용이 몇 a 기준인지 (모든 행이 같아야 함)", "10 (=1,000㎡)"),
+    ("수량(kg)", "조사면적에서 수확·판매한 주산물 양", "kg"),
+    ("판매단가(원/kg)", "농가가 실제로 받은 kg당 가격", "원/kg"),
+    ("종자종묘비", "종자·묘·접목묘 구입액", "원"),
+    ("비료비", "기비·추비·액비·엽면시비", "원"),
+    ("농약비", "살균제·살충제·제초제", "원"),
+    ("수도광열비", "전기·유류·난방·관수", "원"),
+    ("기타재료비", "멀칭필름·상토·유인끈·포장재 등", "원"),
+    ("소농구비", "내용연수가 짧은 소형 농기구", "원"),
+    ("대농구상각비", "농기계 연간 감가상각액", "원"),
+    ("영농시설상각비", "하우스·관수시설 연간 감가상각액", "원"),
+    ("수선비", "농기계·시설 수리·유지", "원"),
+    ("토지임차비", "실제로 낸 농지 임차료 (자가토지면 0)", "원"),
+    ("농기계·시설임차비", "농기계·시설 임차료", "원"),
+    ("위탁영농비", "경운·방제·수확 등 외부 위탁료", "원"),
+    ("고용노동비", "외부 인력에게 실제 지급한 임금", "원"),
+    ("자가노동시간", "본인·가족이 일한 시간 (금액이 아니라 시간)", "시간"),
+]
+
+
+def econ_input_template_xlsx():
+    """경제성 분석 입력 양식(xlsx): '입력' 시트(예시 4행) + '작성 안내' 시트."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+    cols = [c for c, _, _ in _ECON_TEMPLATE_COLS]
+    example = [
+        ["대조구", 1, 10, 250, 15000, 90000, 350000, 300000, 120000, 250000, 30000,
+         200000, 150000, 50000, 0, 80000, 100000, 600000, 95],
+        ["대조구", 2, 10, 262, 15000, 90000, 350000, 300000, 120000, 250000, 30000,
+         200000, 150000, 50000, 0, 80000, 100000, 610000, 97],
+        ["신기술", 1, 10, 290, 15000, 90000, 400000, 290000, 120000, 255000, 30000,
+         200000, 150000, 50000, 0, 80000, 100000, 640000, 105],
+        ["신기술", 2, 10, 284, 15000, 90000, 400000, 290000, 120000, 255000, 30000,
+         200000, 150000, 50000, 0, 80000, 100000, 650000, 103],
+    ]
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "입력"
+    head_fill = PatternFill("solid", fgColor="3D6F9F")
+    ex_fill = PatternFill("solid", fgColor="F2F2F2")
+    thin = Side(style="thin", color="C9DCEB")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for j, c in enumerate(cols, start=1):
+        cell = ws.cell(1, j, c)
+        cell.font = Font(name="맑은 고딕", bold=True, color="FFFFFF")
+        cell.fill = head_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = border
+        ws.column_dimensions[get_column_letter(j)].width = max(10, len(c) * 2 + 2)
+    for i, row in enumerate(example, start=2):
+        for j, v in enumerate(row, start=1):
+            cell = ws.cell(i, j, v)
+            cell.font = Font(name="맑은 고딕", color="7F7F7F", italic=True)
+            cell.fill = ex_fill
+            cell.border = border
+            if isinstance(v, (int, float)) and j > 3:
+                cell.number_format = "#,##0"
+    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 30
+
+    ws2 = wb.create_sheet("작성 안내")
+    notes = [
+        "■ 회색 글씨 4행은 예시입니다. 지우고 실제 자료를 적어 주세요.",
+        "■ 한 줄 = 처리구 × 반복 한 조사구입니다. 조사구 면적 기준 그대로 적고, 조사면적(a)에 그 면적을 적으면 앱이 10a로 환산합니다.",
+        "■ 금액은 모두 '원' 단위로 적습니다(천원·만원 단위 금지). 자가노동시간만 '시간' 단위입니다.",
+        "■ 합계·경영비·소득처럼 계산 결과인 열은 넣지 마세요. 이중으로 계산됩니다.",
+        "■ 소득분석: 모든 비목을 채웁니다. 부분예산표·신기술(MRR): 처리마다 달라지는 비목만 채워도 되고, 모두 채워도 같은 값인 비목은 자동으로 빠집니다.",
+        "■ 쓰지 않는 비목은 0으로 두거나 열을 지워도 됩니다. 필요한 비목은 이름 끝을 '~비'로 지어 추가하면 경영비로 자동 선택됩니다.",
+        "",
+        "열 이름 / 무엇을 적나요 / 단위·예시",
+    ]
+    for i, t in enumerate(notes, start=1):
+        c = ws2.cell(i, 1, t)
+        c.font = Font(name="맑은 고딕", bold=(t.startswith("열 이름")))
+    r0 = len(notes) + 1
+    for k, (c, desc, unit) in enumerate(_ECON_TEMPLATE_COLS):
+        for j, v in enumerate((c, desc, unit), start=1):
+            cell = ws2.cell(r0 + k, j, v)
+            cell.font = Font(name="맑은 고딕")
+            cell.border = border
+    ws2.column_dimensions["A"].width = 22
+    ws2.column_dimensions["B"].width = 60
+    ws2.column_dimensions["C"].width = 16
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def _area_from_data(df):
+    """자료의 '조사면적' 열에서 기준면적(a)을 읽는다. 반환: (값|None, 열이름|None, 경고|None).
+
+    모든 행의 값이 같을 때만 값을 돌려준다. 열 이름에 ㎡/m2가 있으면 a로 바꾼다(100㎡ = 1a).
+    """
+    if df is None or not hasattr(df, "columns"):
+        return None, None, None
+    cands = [c for c in df.columns
+             if "조사면적" in str(c).replace(" ", "") or str(c).replace(" ", "").split("(")[0] == "면적"]
+    if not cands:
+        return None, None, None
+    col = cands[0]
+    s = pd.to_numeric(df[col], errors="coerce").dropna()
+    if s.empty:
+        return None, col, None
+    to_a = 0.01 if any(k in str(col).lower() for k in ("㎡", "m2", "m²")) else 1.0
+    if s.nunique() == 1 and float(s.iloc[0]) > 0:
+        return float(s.iloc[0]) * to_a, col, None
+    return None, col, (f"'{col}' 값이 행마다 다릅니다({s.min():g}~{s.max():g}). 기준면적은 하나만 정할 수 있으니 "
+                       "수량·비용을 같은 면적 기준으로 맞춰 올리거나, 면적별로 나눠 분석하세요.")
+
+
+def _area_prefill(key, df, lo, hi):
+    """조사면적 열 값이 있으면 기준면적 입력칸(key)에 한 번 채워 넣는다(자료가 바뀔 때마다 1회)."""
+    v, col, warn = _area_from_data(df)
+    sig = (st.session_state.get("cur_key"), col, v)
+    if v is not None and lo <= v <= hi and st.session_state.get(f"_area_sig_{key}") != sig:
+        st.session_state[key] = float(v)
+        st.session_state[f"_area_sig_{key}"] = sig
+    return v, col, warn
+
+
+def _area_note(target, v, col, warn):
+    """기준면적 입력칸 아래 안내."""
+    if warn:
+        target.warning("⚠️ " + warn)
+    elif v is not None:
+        target.caption(f"📐 '{col}' 열에서 {v:g}a를 읽어 기준면적에 넣었습니다.")
 
 
 def price_db_warnings(db, current_year=None):
@@ -5942,392 +7463,6 @@ def price_db_warnings(db, current_year=None):
                     + " — 값을 채우기 전에는 계산에 자동 반영하지 않습니다.")
     return msgs
 
-def _kamis_parse_unit(unit_text):
-    """'20kg' → (20.0, '20kg') 처럼 kg 환산계수를 추출. 환산 불가면 (None, 원문)"""
-    import re as _re
-    if not unit_text:
-        return None, ""
-    t = str(unit_text).strip()
-    m = _re.match(r"^\s*([\d.]+)?\s*(kg|g|톤|개|포|망|상자|단)\s*$", t, _re.I)
-    if not m:
-        return None, t
-    num = float(m.group(1)) if m.group(1) else 1.0
-    unit = m.group(2).lower()
-    if unit == "kg":
-        return num, t
-    if unit == "g":
-        return num / 1000.0, t
-    if unit == "톤":
-        return num * 1000.0, t
-    return None, t          # 개·포·망 등은 kg 환산 불가
-
-
-def _kamis_ssl_context(verify=True, legacy=True):
-    """KAMIS(구형 국내 서버) 호환 SSLContext.
-
-    OpenSSL 3.x 는 기본적으로
-      - RFC5746 미지원 서버(레거시 재협상)
-      - SECLEVEL 2 미만의 약한 키/암호군
-      - TLS 1.0/1.1
-    을 모두 거부한다. 국내 공공기관 서버는 이 중 하나에 걸리는 경우가 많아
-    핸드셰이크 단계에서 SSLError 가 난다. 아래 컨텍스트는 검증(인증서 확인)은
-    그대로 유지한 채 호환성 옵션만 풀어 준다.
-    """
-    import ssl as _ssl
-    ctx = _ssl.create_default_context()
-    if legacy:
-        # OP_LEGACY_SERVER_CONNECT (0x4) : RFC5746 미지원 서버 허용
-        ctx.options |= getattr(_ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
-        try:
-            import warnings as _w
-            with _w.catch_warnings():
-                _w.simplefilter("ignore", DeprecationWarning)
-                ctx.minimum_version = _ssl.TLSVersion.TLSv1
-        except Exception:
-            pass
-        for _cipher in ("DEFAULT@SECLEVEL=1", "ALL:@SECLEVEL=1"):
-            try:
-                ctx.set_ciphers(_cipher)
-                break
-            except Exception:
-                continue
-    if not verify:
-        ctx.check_hostname = False
-        ctx.verify_mode = _ssl.CERT_NONE
-    return ctx
-
-
-def _kamis_session(ssl_context=None):
-    """지정한 SSLContext 를 http/https 양쪽에 적용한 requests 세션."""
-    from requests.adapters import HTTPAdapter
-
-    class _KamisAdapter(HTTPAdapter):
-        def __init__(self, ssl_context=None, **kw):
-            self._kamis_ctx = ssl_context
-            super().__init__(**kw)
-
-        def init_poolmanager(self, *a, **kw):
-            if self._kamis_ctx is not None:
-                kw["ssl_context"] = self._kamis_ctx
-            return super().init_poolmanager(*a, **kw)
-
-        def proxy_manager_for(self, *a, **kw):
-            if self._kamis_ctx is not None:
-                kw["ssl_context"] = self._kamis_ctx
-            return super().proxy_manager_for(*a, **kw)
-
-    sess = _requests.Session()
-    adapter = _KamisAdapter(ssl_context=ssl_context, max_retries=0)
-    sess.mount("https://", adapter)
-    sess.mount("http://", adapter)
-    return sess
-
-
-def kamis_request(url, params, timeout=20):
-    """KAMIS 공식 Open-API 호출 (다단계 폴백).
-
-    공식 도메인은 ``www.kamis.or.kr`` 이고 공식 예제는 http/https 를 모두 쓴다.
-    KAMIS 서버는 구형 TLS 설정을 쓰는 경우가 있어 OpenSSL 3.x 환경
-    (Streamlit Cloud 등)에서 기본 설정만으로는 핸드셰이크가 실패할 수 있다.
-    아래 순서대로 시도하고, 성공한 방식을 ``r._smart_transport`` 에 기록한다.
-
-      1) https + 기본 설정                → 'https'
-      2) http  (리다이렉트 시 레거시 컨텍스트) → 'http-fallback'
-      3) https + 레거시 호환 컨텍스트(검증 유지) → 'https-legacy'
-      4) https + 레거시 + 인증서 검증 생략   → 'https-insecure' (경고 표시)
-
-    4단계는 인증서 검증을 끄므로 최후 수단이며, 성공해도 UI 에 경고를 띄운다.
-    """
-    if not _HAS_REQUESTS:
-        raise RuntimeError("requests 라이브러리가 없습니다. pip install requests")
-
-    raw_url = str(url).strip()
-    if raw_url.startswith("http://"):
-        https_url = "https://" + raw_url[len("http://"):]
-    elif raw_url.startswith("https://"):
-        https_url = raw_url
-    else:
-        https_url = "https://" + raw_url.lstrip("/")
-    http_url = "http://" + https_url[len("https://"):]
-
-    headers = {
-        'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                       'AppleWebKit/537.36 (KHTML, like Gecko) '
-                       'Chrome/131.0 Safari/537.36'),
-        'Accept': 'application/json, application/xml, text/xml, */*',
-        'Connection': 'close',
-    }
-
-    attempts = []          # (라벨, 호출가능객체) 순서대로 시도
-    attempts.append(("https", lambda: _requests.get(
-        https_url, params=params, timeout=timeout, headers=headers)))
-
-    def _legacy_http():
-        sess = _kamis_session(_kamis_ssl_context(verify=True, legacy=True))
-        try:
-            return sess.get(http_url, params=params, timeout=timeout,
-                            headers=headers)
-        finally:
-            try: sess.close()
-            except Exception: pass
-    attempts.append(("http-fallback", _legacy_http))
-
-    def _legacy_https():
-        sess = _kamis_session(_kamis_ssl_context(verify=True, legacy=True))
-        try:
-            return sess.get(https_url, params=params, timeout=timeout,
-                            headers=headers)
-        finally:
-            try: sess.close()
-            except Exception: pass
-    attempts.append(("https-legacy", _legacy_https))
-
-    def _insecure_https():
-        try:
-            import urllib3 as _u3
-            _u3.disable_warnings(_u3.exceptions.InsecureRequestWarning)
-        except Exception:
-            pass
-        sess = _kamis_session(_kamis_ssl_context(verify=False, legacy=True))
-        try:
-            return sess.get(https_url, params=params, timeout=timeout,
-                            headers=headers, verify=False)
-        finally:
-            try: sess.close()
-            except Exception: pass
-    attempts.append(("https-insecure", _insecure_https))
-
-    errors = []
-    for label, call in attempts:
-        try:
-            r = call()
-        except Exception as ex:
-            errors.append(f"{label}: {_kamis_err_text(ex)}")
-            continue
-        try:
-            r._smart_transport = label
-        except Exception:
-            pass
-        return r
-
-    raise RuntimeError(
-        "KAMIS 서버에 연결하지 못했습니다. 시도한 방식과 원인:\n- "
-        + "\n- ".join(errors))
-
-
-def _kamis_err_text(ex, limit=200):
-    """SSLError 등의 실제 원인(가장 안쪽 예외)까지 풀어서 문자열로 만든다."""
-    parts, seen, cur = [], set(), ex
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        txt = str(cur).strip()
-        if txt and txt not in parts:
-            parts.append(txt)
-        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
-    # urllib3 는 원인을 reason 속성에 담아 두기도 한다
-    reason = getattr(ex, "reason", None)
-    if reason is not None and str(reason).strip() not in parts:
-        parts.append(str(reason).strip())
-    msg = " / ".join(parts) if parts else type(ex).__name__
-    # 가장 유용한 [SSL: XXX] 코드가 있으면 앞으로 끌어올린다
-    import re as _re
-    m = _re.search(r"\[SSL:[^\]]+\][^\)\'\"]*", msg)
-    head = f"{type(ex).__name__}"
-    if m:
-        return f"{head} {m.group(0).strip()} | {msg[:limit]}"
-    return f"{head}: {msg[:limit]}"
-
-
-KAMIS_ITEM_CATEGORY_MAP = {
-    "111": "100", "211": "200", "225": "200", "231": "200", "245": "200",
-    "258": "200", "312": "300", "411": "400",
-}
-
-
-def _normalize_kamis_date(year, regday):
-    import re as _re
-    y = str(year or "").strip()
-    d = str(regday or "").strip().replace("/", "-").replace(".", "-")
-    d = _re.sub(r"-+", "-", d).strip("-")
-    if not d:
-        return y
-    if len(d.split("-")) == 2 and y:
-        mm, dd = d.split("-", 1)
-        return f"{y}-{int(mm):02d}-{int(dd):02d}"
-    if len(d.split("-")) == 3:
-        yy, mm, dd = d.split("-", 2)
-        return f"{int(yy):04d}-{int(mm):02d}-{int(dd):02d}"
-    return f"{y}-{d}".strip("-")
-
-
-def kamis_fetch(cert_key, cert_id, item_code, kind_code, rank_code,
-                days=7, country_code="", product_cls="02", category_code=None,
-                market_type="도매", convert_kg=False, county_code=None):
-    """KAMIS 기간별 품목가격 조회. 반환: (DataFrame|None, 오류메시지|None).
-
-    county_code는 이전 버전 호출과의 호환용이며 실제 요청에는 공식 p_countrycode를 사용한다.
-    """
-    if county_code and not country_code:
-        country_code = county_code
-    missing = [n for n, v in [("인증키", cert_key), ("아이디", cert_id),
-                              ("품목코드", item_code)] if not str(v or "").strip()]
-    if missing:
-        return None, f"{', '.join(missing)}을(를) 입력해 주세요."
-    try:
-        days = int(days)
-        if not (1 <= days <= 365):
-            return None, "조회 기간은 1~365일 사이여야 합니다."
-    except (TypeError, ValueError):
-        return None, "조회 기간이 올바르지 않습니다."
-    item_code = str(item_code).strip()
-    category_code = str(category_code or KAMIS_ITEM_CATEGORY_MAP.get(item_code, "")).strip()
-    if not category_code:
-        return None, "품목에 맞는 부류코드를 지정해 주세요(예: 채소 200, 특용작물 300)."
-    if market_type not in ("도매", "소매"):
-        return None, "시장 유형은 '도매' 또는 '소매'여야 합니다."
-
-    import datetime as _dt
-    end = _dt.date.today()
-    start = end - _dt.timedelta(days=days)
-    # KAMIS의 일별 품목별 도·소매 가격 API는 periodProductList 하나를 사용하고
-    # p_productclscode로 도매(02)/소매(01)를 구분한다.
-    action = "periodProductList"
-    product_cls = "02" if market_type == "도매" else "01"
-    url = "https://www.kamis.or.kr/service/price/xml.do"
-    params = {"action": action,
-              "p_cert_key": str(cert_key).strip(), "p_cert_id": str(cert_id).strip(),
-              "p_returntype": "json", "p_startday": start.isoformat(),
-              "p_endday": end.isoformat(), "p_productclscode": str(product_cls),
-              "p_itemcategorycode": category_code, "p_itemcode": item_code,
-              "p_kindcode": str(kind_code or ""), "p_productrankcode": str(rank_code or ""),
-              "p_countrycode": str(country_code or ""),
-              "p_convert_kg_yn": "Y" if convert_kg else "N"}
-    try:
-        r = kamis_request(url, params)
-    except RuntimeError as ex:
-        return None, str(ex)
-    except Exception as ex:
-        return None, f"KAMIS 연결 오류 - {_kamis_err_text(ex)}"
-    if getattr(r, "status_code", 0) != 200:
-        return None, f"KAMIS 서버 응답 오류(HTTP {getattr(r, 'status_code', '?')})"
-    # KAMIS는 xml.do 주소에서 p_returntype=json을 써도 환경/오류 종류에 따라
-    # XML을 돌려주는 경우가 있어 JSON과 XML을 모두 받을 수 있게 한다.
-    js = None
-    try:
-        js = r.json()
-    except Exception:
-        try:
-            import xml.etree.ElementTree as _ETK
-            _root = _ETK.fromstring(getattr(r, "text", "") or "")
-            def _xml_dict(el):
-                children = list(el)
-                if not children:
-                    return (el.text or "").strip()
-                out = {}
-                for ch in children:
-                    val = _xml_dict(ch)
-                    if ch.tag in out:
-                        if not isinstance(out[ch.tag], list): out[ch.tag] = [out[ch.tag]]
-                        out[ch.tag].append(val)
-                    else:
-                        out[ch.tag] = val
-                return out
-            js = _xml_dict(_root)
-        except Exception:
-            _ct = str(getattr(r, "headers", {}).get("Content-Type", ""))[:80]
-            return None, ("KAMIS 응답 형식을 해석하지 못했습니다. "
-                          f"HTTP {getattr(r, 'status_code', '?')}, Content-Type={_ct or '미상'}")
-
-    if isinstance(js, dict):
-        condition = js.get("condition") or {}
-        code = (condition.get("code") if isinstance(condition, dict) else None)
-        code = code or js.get("error_code") or js.get("errCode")
-        if code and str(code) not in ("000", "0"):
-            msg = condition.get("message") if isinstance(condition, dict) else ""
-            return None, f"KAMIS 오류({code}): {msg or '인증 정보 또는 조회 조건을 확인해 주세요.'}"
-        data = js.get("data", js)
-    else:
-        data = js
-    if isinstance(data, dict):
-        _dcode = (data.get("error_code") or data.get("errCode") or
-                  data.get("result_code") or data.get("resultCode"))
-        if _dcode and str(_dcode) not in ("000", "0"):
-            _dmsg = data.get("error_msg") or data.get("message") or data.get("result_msg") or ""
-            return None, f"KAMIS 오류({_dcode}): {_dmsg or '인증 정보 또는 조회 조건을 확인해 주세요.'}"
-    items = data.get("item") if isinstance(data, dict) else (data if isinstance(data, list) else None)
-    if not items:
-        return None, "조회 결과가 없습니다. 품목·품종·등급·지역·기간을 확인해 주세요."
-    if isinstance(items, dict):
-        items = [items]
-    rows = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        date_s = _normalize_kamis_date(it.get("yyyy"), it.get("regday"))
-        unit_raw = it.get("unit") or it.get("unitname") or ("1kg" if convert_kg else "")
-        kg_factor, unit_text = _kamis_parse_unit(unit_raw)
-        price_raw = str(it.get("price", "")).replace(",", "").strip()
-        try:
-            price = float(price_raw) if price_raw not in ("", "-") else float("nan")
-        except ValueError:
-            price = float("nan")
-        rows.append({"기준일": date_s, "시장유형": market_type,
-                     "품목": it.get("itemname", ""), "품종": it.get("kindname", ""),
-                     "시장/지역": it.get("countyname", it.get("marketname", "")),
-                     "가격": price, "단위": unit_text or "(단위 미상)",
-                     "kg환산계수": kg_factor, "부류코드": category_code,
-                     "품목코드": item_code, "출처": "KAMIS 농산물유통정보"})
-    if not rows:
-        return None, "조회 결과를 표로 만들지 못했습니다."
-    _dfk = pd.DataFrame(rows)
-    try:
-        _dfk.attrs["kamis_transport"] = getattr(r, "_smart_transport", "https")
-    except Exception:
-        pass
-    return _dfk, None
-
-
-@st.cache_data(show_spinner=False, ttl=3600, max_entries=30)
-def kosis_fetch_url(url):
-    """KOSIS 오픈API URL을 그대로 호출해 표로 변환 (KOSIS 사이트에서 복사한 URL 사용)"""
-    if not _HAS_REQUESTS:
-        return None, "requests 라이브러리가 없습니다."
-    if "kosis.kr" not in url:
-        return None, "KOSIS 주소가 아닙니다. kosis.kr 로 시작하는 URL을 넣어 주세요."
-    try:
-        u = url.strip().replace("http://", "https://")
-        if "format=" not in u:
-            u += ("&" if "?" in u else "?") + "format=json&jsonVD=Y"
-        r = _requests.get(u, timeout=30)
-        if r.status_code != 200:
-            return None, f"KOSIS 오류({r.status_code})"
-        js = r.json()
-        if isinstance(js, dict) and js.get("err"):
-            return None, f"KOSIS 응답 오류: {js.get('errMsg', js.get('err'))}"
-        if not isinstance(js, list) or not js:
-            return None, "조회 결과가 없습니다. 통계표·시점 설정을 확인해 주세요."
-        rows = []
-        for it in js:
-            rows.append({
-                "시점": it.get("PRD_DE", ""),
-                "항목": it.get("ITM_NM", ""),
-                "분류1": it.get("C1_NM", ""),
-                "분류2": it.get("C2_NM", ""),
-                "값": it.get("DT", ""),
-                "단위": it.get("UNIT_NM", ""),
-                "통계표": it.get("TBL_NM", "")})
-        return pd.DataFrame(rows), None
-    except Exception as ex:
-        return None, f"조회 실패: {str(ex)[:80]}"
-
-def kosis_build_url(api_key, org_id, tbl_id, itm_id="ALL", obj_l1="ALL",
-                    prd_se="Y", count=5):
-    """파라미터로 KOSIS 요청 URL 만들기"""
-    return ("https://kosis.kr/openapi/Param/statisticsParameterData.do"
-            f"?method=getList&apiKey={api_key}&itmId={itm_id}&objL1={obj_l1}"
-            f"&format=json&jsonVD=Y&prdSe={prd_se}&newEstPrdCnt={int(count)}"
-            f"&orgId={org_id}&tblId={tbl_id}")
-
 def get_price(item, default=0.0):
     """기준단가 DB에서 값을 읽음(없으면 default)"""
     db = st.session_state.get("price_db")
@@ -6350,6 +7485,16 @@ def run_autopilot_engine(df, ph="Tukey HSD", err_type=None, max_items=8,
     # ---------- 1단계: 숫자 정제 ----------
     with st.spinner("1/5 데이터를 점검하고 정리하는 중..."):
         work = clean_columns(df.copy())
+        # 평균·합계 같은 요약 행은 하나의 처리로 계산되므로 먼저 뺀다.
+        _sum_pos = summary_row_positions(work)
+        if _sum_pos:
+            _sum_lab = [str(next((x for x in r if isinstance(x, str) and _is_summary_label(x)), ""))
+                        for r in work.iloc[_sum_pos].itertuples(index=False)]
+            _sum_lab = [x for x in _sum_lab if x]
+            work = drop_row_positions(work, _sum_pos)
+            msgs.append(f"평균·합계 같은 요약 행 {len(_sum_pos)}개를 빼고 분석했습니다"
+                        + (f": {', '.join(_sum_lab[:6])}" + (" …" if len(_sum_lab) > 6 else "") if _sum_lab else "")
+                        + " (원자료에는 그대로 있습니다)")
         # 처리구·반복으로 쓸 열은 숫자 변환에서 제외 (이름이 숫자로 바뀌는 것 방지)
         _keep_text = set()
         _pre = detect_design(work)
@@ -6439,7 +7584,7 @@ def run_autopilot_engine(df, ph="Tukey HSD", err_type=None, max_items=8,
                     _ikey = f"C({q_ref(trt)}):C({q_ref(_sub)})"
                     if _ikey in aov.index and float(aov.loc[_ikey, "PR(>F)"]) < .05:
                         msgs.append(f"[{yv}] '{trt}'×'{_sub}' 상호작용이 유의합니다"
-                                    f"(p={float(aov.loc[_ikey, 'PR(>F)']):.4f}). '{trt}' 평균만 비교하지 말고 "
+                                    f"({_ptxt(float(aov.loc[_ikey, 'PR(>F)']), 4)}). '{trt}' 평균만 비교하지 말고 "
                                     "'📊 통계분석 → 이원배치'에서 조합별로 확인하세요.")
                 ci = calc_cv_lsd(model, data, trt, yv)
                 _is_dunnett = str(ph).startswith(("던넷", "Dunnett"))
@@ -6484,7 +7629,7 @@ def run_autopilot_engine(df, ph="Tukey HSD", err_type=None, max_items=8,
                 ax.set_ylabel(yv)
                 ax.margins(y=.16 if pretty_on() else .05)
                 deco(ax, f"{trt}별 {yv} (평균±{'표준오차' if use_se else '표준편차'})")
-                plt.tight_layout()
+                fig.tight_layout()
                 png = fig_to_png(fig, show=False)
 
                 sent = report_sentence_anova(trt, yv, pval, means, letters, ci, ph)
@@ -6497,7 +7642,7 @@ def run_autopilot_engine(df, ph="Tukey HSD", err_type=None, max_items=8,
                     "최고 처리구": order[0],
                     "최고 평균": round(float(means.loc[order[0], "mean"]), rnd()),
                     "최저 처리구": order[-1],
-                    "p-value": round(pval, 4),
+                    "p-value": _pcell(pval, 4),
                     "유의성": "유의(*)" if pval < .05 else "n.s.",
                     "CV(%)": round(ci["CV"], 1) if not np.isnan(ci["CV"]) else "-",
                     "LSD(0.05)": round(ci["LSD"], 2) if not np.isnan(ci["LSD"]) else "-"})
@@ -6515,7 +7660,7 @@ def run_autopilot_engine(df, ph="Tukey HSD", err_type=None, max_items=8,
     with st.spinner("4/5 종합 요약을 만드는 중..."):
         summary = pd.DataFrame(summary_rows)
         n_sig = int((summary["유의성"] == "유의(*)").sum())
-        head_txt = (f"◦ {dsg['design']}으로 배치된 시험 자료를 분석하였다.\n"
+        head_txt = (f"◦ {dsg['design']}{_josa(dsg['design'], '으로/로')} 배치된 시험 자료를 분석하였다.\n"
                     f"◦ 총 {len(summary)}개 측정항목 중 {n_sig}개 항목에서 "
                     "처리 간 유의한 차이가 인정되었다.")
         # 이번 원클릭 분석에서 실제로 한 것만 근거로 쓴다(세션의 예전 이력은 섞지 않음).
@@ -6594,7 +7739,7 @@ def plot_sensitivity_heatmap(mat, title="수량·단가가 동시에 변할 때�
             _cb.outline.set_visible(False)
     except Exception:
         pass
-    plt.tight_layout(pad=1.2)
+    fig.tight_layout(pad=1.2)
     return fig
 
 LABOR_HINTS = ("노동시간", "노력시간", "작업시간", "소요시간", "노동(시간", "시간")
@@ -6939,7 +8084,10 @@ def _ai_panel(df, menu_name):
     if ups:
         st.caption("첨부: " + ", ".join(getattr(f, "name", "?") for f in ups))
     b1, b2 = st.columns([3, 1])
-    if b1.button("물어보기", key="gai_send", type="primary", width="stretch") and q.strip():
+    _send = b1.button("물어보기", key="gai_send", type="primary", width="stretch")
+    if _send and not q.strip():
+        st.warning("질문을 입력한 뒤 눌러 주세요. (입력 후 바깥을 한 번 누르거나 Ctrl+Enter)")
+    if _send and q.strip():
         try:
             ctx = ""
             if df is not None:
@@ -6947,6 +8095,10 @@ def _ai_panel(df, menu_name):
                 # 그대로 + 로 이으면 TypeError 가 나므로 f-string 으로 문자열화한다.
                 _prof = build_group_profiles(df, question=q)
                 ctx = (f"{build_data_overview(df)}\n\n[처리·품종별 요약]\n{_prof}")
+            # 직전 대화(최근 2문답)를 함께 보내 '이어서 설명해줘' 같은 후속 질문이 통하게 한다.
+            _prev = st.session_state.get("gai_hist", [])[-4:]
+            _gai_prev = ("\n\n[직전 대화]\n" + "\n".join(
+                ("질문: " if r == "q" else "답변: ") + str(t)[:1500] for r, t in _prev)) if _prev else ""
             att = ""
             if ups:
                 per = max(1500, _ATT_LIMIT // len(ups))
@@ -6960,17 +8112,22 @@ def _ai_panel(df, menu_name):
                     "앱 사용법을 묻는다면 화면 이름을 들어 안내하세요.\n\n"
                     + (ctx or "(현재 선택된 데이터가 없습니다.)")
                     + (f"\n\n[사용자가 올린 파일]{att}" if att else "")
-                    + f"\n\n질문: {q}", max_tokens=900)
+                    + _gai_prev + f"\n\n질문: {q}", max_tokens=2000)
         except Exception as _ex:
             ans = f"⚠️ AI 호출 실패: {type(_ex).__name__}: {_ex}"
+        if not str(ans or "").strip():
+            ans = "⚠️ AI 응답이 비어 있습니다. 잠시 후 다시 시도하거나 사이드바에서 모델을 바꿔 보세요."
         _qlog = q + (("\n\n📎 " + ", ".join(getattr(f, "name", "?") for f in ups))
                      if ups else "")
         st.session_state["gai_hist"] = (st.session_state.get("gai_hist", [])
                                         + [("q", _qlog), ("a", ans)])[-12:]
-        st.rerun()
-    if b2.button("지우기", key="gai_clear", width="stretch"):
-        st.session_state["gai_hist"] = []
-        st.rerun()
+        # st.rerun()을 부르면 떠 있는 창(popover)이 닫혀 답이 안 보인다 — 방금 답을 바로 그린다.
+        with st.chat_message("user"):
+            st.markdown(_qlog)
+        with st.chat_message("assistant"):
+            st.markdown(ans)
+    b2.button("지우기", key="gai_clear", width="stretch",
+              on_click=lambda: st.session_state.update({"gai_hist": []}))
     st.caption("⚠️ AI 답변은 초안입니다. 수치와 해석은 연구자가 확인해 주세요.")
 
 
@@ -7104,8 +8261,58 @@ if df is None and menu not in ("📑 보고서", "📖 사용설명서"):
 if df is not None:
     num_cols = df.select_dtypes(include=np.number).columns.tolist()
     cat_cols = df.select_dtypes(exclude=np.number).columns.tolist()
+    # 숫자로 적힌 반복·처리 코드(반복=1,2,3 등)를 측정값으로 고르면 블록 지정이 빠져
+    # 난괴법이 완전임의배치로 분석된다(p값이 뒤집힘). 그래서 이름이 반복·처리 코드이고 값이 정수 코드(15종 이하)인 열만 범주형으로 옮긴다.
+    # 리커트 1~5점, 농도처럼 숫자 자체가 의미 있는 열은 건드리지 않는다.
+    # (두 목록이 겹치지 않아야 같은 열이 그룹·측정값으로 동시에 선택되지 않는다)
+    def _is_id_code(c):
+        if not any(k in str(c).lower() for k in _BLOCK_KEYS + ["처리", "시험구", "구분", "품종", "계통"]):
+            return False
+        s = pd.to_numeric(df[c], errors="coerce").dropna()
+        if s.empty or s.nunique() > 15:
+            return False
+        v = s.to_numpy(dtype=float)
+        return bool(np.allclose(v, np.round(v)))
+    try:
+        _id_like = [c for c in num_cols if _is_id_code(c)]
+    except Exception:
+        _id_like = []
+    if _id_like:
+        num_cols = [c for c in num_cols if c not in _id_like]
+        cat_cols = cat_cols + [c for c in df.columns if c in _id_like and c not in cat_cols]
 else:
     num_cols, cat_cols = [], []
+
+# ================================================================ 데이터를 처음 불러왔을 때 점검 요약
+# 문제가 있으면 화면 위에 한 번 알려 준다. '확인했어요'를 누르거나 📋 데이터 화면을 보면 다시 띄우지 않고,
+# 같은 이름으로 고친 파일을 다시 올리면(내용이 바뀌면) 다시 보여 준다.
+try:
+    _ck_name = st.session_state.get("cur_key")
+    _ck_seen = st.session_state.setdefault("_checkup_seen", set())
+    _ck_sigs = st.session_state.setdefault("_checkup_seen_sig", {})
+    _ck_sig = _ck_upload_sig(_ck_name)
+    _ck_is_new = bool(_ck_name) and (_ck_name not in _ck_seen
+                                     or (_ck_name in _ck_sigs and _ck_sigs[_ck_name] != _ck_sig))
+    _ck_on_data_tab = (menu == "📊 통계분석" and st.session_state.get("stat_sub", "📋 데이터") == "📋 데이터")
+    if (df is not None and _ck_is_new and not _ck_on_data_tab
+            and menu not in ("📖 사용설명서", "👑 관리자")):
+        _ck_find = checkup_for(df)
+        _ck_cnt = checkup_counts(_ck_find)
+        if _ck_cnt["error"] or _ck_cnt["warn"]:
+            with st.container(border=True):
+                st.markdown(f"#### 📋 방금 불러온 '{_ck_name}' 데이터를 점검했어요")
+                render_checkup(_ck_find, compact=True)
+                checkup_fix_buttons(df, "popup")
+                st.caption("자세한 내용과 '숫자로 자동 변환'은 **📊 통계분석 → 📋 데이터**에서 볼 수 있어요.")
+                if st.button("확인했어요", key="checkup_ack"):
+                    _ck_seen.add(_ck_name)
+                    _ck_sigs[_ck_name] = _ck_sig
+                    st.rerun()
+        else:
+            _ck_seen.add(_ck_name)
+            _ck_sigs[_ck_name] = _ck_sig
+except Exception:
+    pass
 
 # ================================================================ 통계분석
 # ================================================================ 원클릭 오토파일럿
@@ -7122,7 +8329,12 @@ if menu == "⚡ 원클릭 보고서":
         c1, c2, c3 = st.columns(3)
         c1.metric("행", f"{len(df):,}"); c2.metric("열", len(df.columns))
         c3.metric("숫자형 항목", len(df.select_dtypes(include=np.number).columns))
-        _pre = detect_design(df)
+        # 엔진과 같은 기준으로 보이도록, 요약 행(평균·합계)은 빼고 설계를 인지한다.
+        _ap_sum = summary_row_positions(df)
+        _pre = detect_design(drop_row_positions(df, _ap_sum) if _ap_sum else df)
+        if _ap_sum:
+            st.info(f"🧹 평균·합계 같은 요약 행 {len(_ap_sum)}개({_ck_row_labels(df, [df.index[p] for p in _ap_sum], 3)})는 "
+                    "자동으로 빼고 분석합니다. 원자료는 바뀌지 않습니다.")
         if _pre.get("trt"):
             st.caption(f"🔬 자동 인지: **{_pre['design']}** — 처리구 '{_pre['trt']}'"
                        + (f", 반복 '{_pre['blk']}'" if _pre.get("blk") else ", 반복 없음"))
@@ -7220,12 +8432,18 @@ if menu == "⚡ 원클릭 보고서":
                         st.image(blk["image"], width=640)
 
             st.markdown("### 🧾 통계 처리 문구")
-            st.code(ap["stat_line"], language=None)
+            st.code(sentence_lines(ap["stat_line"]), language=None, wrap_lines=True)
+            st.caption("화면에서는 문장마다 줄을 바꿔 보여 줍니다. 한글·워드 보고서에는 한 문단으로 들어갑니다.")
 
 elif menu == "📊 통계분석":
     st.title("실험 데이터 자동 통계 분석")
     st.markdown("### 🤖 AI 통계 방법 추천")
-    for rec in recommend_analysis(df): st.success(rec)
+    # 평균·합계 요약 행은 처리 수를 부풀리므로 추천 판단에서만 빼고 본다(데이터는 그대로).
+    try:
+        _rec_df = drop_row_positions(df, summary_row_positions(df))
+    except Exception:
+        _rec_df = df
+    for rec in recommend_analysis(_rec_df): st.success(rec)
     st.divider()
 
     _SUB = ["📋 데이터", "🧹 전처리", "🧮 파생변수", "🔗 상관분석", "📈 분산분석",
@@ -7258,50 +8476,35 @@ elif menu == "📊 통계분석":
                        "필요한 기간·처리만 걸러서 사용하시길 권장합니다.")
         # ---------- 데이터 검진 ----------
         st.markdown("#### 🩺 데이터 검진")
-        issues = []
+        st.caption("올린 자료에 문제가 없는지 먼저 확인합니다. 📍 엑셀 위치와 🔧 고치는 법을 함께 알려 드려요.")
         numlike = find_numeric_like(df)
-        if numlike:
-            issues.append(("warn",
-                "숫자로 보이지만 문자로 읽힌 열이 있습니다: "
-                f"{', '.join(f'{k}({v}%)' for k, v in numlike.items())}"))
-        n_miss = int(df.isna().sum().sum())
-        if n_miss:
-            issues.append(("warn", f"결측치 {n_miss}개 — '전처리' 탭에서 처리할 수 있습니다."))
-        n_dup = int(df.duplicated().sum())
-        if n_dup:
-            issues.append(("warn", f"완전히 같은 행이 {n_dup}개 있습니다(중복 입력 가능성)."))
-        numc = df.select_dtypes(include=np.number).columns
-        neg = [c for c in numc if (df[c] < 0).any()]
-        if neg:
-            issues.append(("info", f"음수가 포함된 열: {', '.join(neg)} — 입력 오류가 아닌지 확인하세요."))
-        const = [c for c in df.columns if df[c].nunique(dropna=True) <= 1]
-        if const:
-            issues.append(("info", f"값이 모두 같은 열: {', '.join(const)} — 분석에서 제외됩니다."))
-        # 실험설계 추정 (숫자로 적힌 반복·처리 코드도 함께 인식)
-        _ys_c, catc, _promoted_c = split_code_columns(df)
-        if _promoted_c:
-            issues.append(("info",
-                f"숫자로 적혀 있지만 처리구·반복 코드로 보이는 열: {', '.join(map(str, _promoted_c))} "
-                "— 측정값이 아니라 그룹 구분으로 인식했습니다. 실제 측정값이면 분산분석에서 직접 골라 주세요."))
+        # 실험설계 추정 (숫자로 적힌 반복·처리 코드도 함께 인식) — 요약 행·빈 행은 빼고 본다
+        _dfd = drop_row_positions(df, set(summary_row_positions(df)) | set(blank_row_positions(df)))
+        _ys_c, catc, _promoted_c = split_code_columns(_dfd)
         design_msg = None
         for cand in catc:
             if any(k in str(cand).lower() for k in _BLOCK_KEYS):
                 other = [c for c in catc if c != cand]
                 if other:
-                    tab = df.groupby([other[0], cand]).size()
+                    tab = _dfd.groupby([other[0], cand]).size()
                     balanced = tab.nunique() == 1
                     design_msg = (f"'{other[0]}' × '{cand}' 구조가 감지되었습니다 → "
                                   + ("**난괴법(RCBD)**으로 보입니다. 분산분석에서 반복(블록) 열로 "
-                                     f"'{cand}'을 꼭 지정하세요." if balanced
+                                     f"'{cand}'{_josa(cand, '을/를')} 꼭 지정하세요." if balanced
                                      else "반복 수가 고르지 않습니다(불균형). 결측을 확인하세요."))
                 break
         if design_msg:
             st.success("🔬 " + design_msg)
-        if not issues:
-            st.success("✅ 특별한 문제가 발견되지 않았습니다.")
-        else:
-            for kind, msg in issues:
-                (st.warning if kind == "warn" else st.info)(msg)
+        render_checkup(checkup_for(df))
+        checkup_fix_buttons(df, "data")
+        if _promoted_c:
+            st.info(f"숫자로 적혀 있지만 처리구·반복 코드로 보이는 열: {', '.join(map(str, _promoted_c))} "
+                    "— 측정값이 아니라 그룹 구분으로 인식했습니다. 실제 측정값이면 분산분석에서 직접 골라 주세요.")
+        # 이 화면을 봤으면 '방금 불러온 데이터 점검' 상자는 다시 띄우지 않는다.
+        if st.session_state.get("cur_key"):
+            _ckn = st.session_state["cur_key"]
+            st.session_state.setdefault("_checkup_seen", set()).add(_ckn)
+            st.session_state.setdefault("_checkup_seen_sig", {})[_ckn] = _ck_upload_sig(_ckn)
         if numlike:
             st.markdown("###### 🔧 숫자로 자동 변환")
             fixcols = st.multiselect("변환할 열", list(numlike.keys()),
@@ -7402,7 +8605,7 @@ elif menu == "📊 통계분석":
                         smart_table(out_rows, width="stretch")
                     fig, ax = plt.subplots(figsize=(min(12, 1.5*len(ocols)+2), 4))
                     df[ocols].plot(kind="box", ax=ax); ax.set_title("상자그림(이상값 확인)")
-                    plt.xticks(rotation=30); show_plot(fig); plt.close(fig)
+                    ax.tick_params(axis="x", labelrotation=30); show_plot(fig); plt.close(fig)
                     act = st.radio("처리 방법", ["해당 행 삭제", "경계값으로 대체(윈저화)", "결측치로 변경"], horizontal=True)
                     if st.button("적용", key="p_out"):
                         d = st.session_state.df.copy()
@@ -7538,6 +8741,7 @@ elif menu == "📊 통계분석":
                 # ---- 유의성 별표 표기 (논문 관행) ----
                 _meth = stats.pearsonr if cmethod.startswith("Pearson") else stats.spearmanr
                 star_tbl = pd.DataFrame(index=corr.index, columns=corr.columns, dtype=object)
+                _pmat = pd.DataFrame(np.nan, index=corr.index, columns=corr.columns)
                 n_pairs = 0
                 for a in sel:
                     for b in sel:
@@ -7550,6 +8754,7 @@ elif menu == "📊 통계분석":
                             continue
                         try:
                             r_, p_ = _meth(sub[a], sub[b])
+                            _pmat.loc[a, b] = float(p_)
                             mark = "***" if p_ < .001 else "**" if p_ < .01 else "*" if p_ < .05 else ""
                             star_tbl.loc[a, b] = f"{r_:.3f}{mark}"
                             if mark and a < b: n_pairs += 1
@@ -7562,7 +8767,10 @@ elif menu == "📊 통계분석":
                            f"／ 유의한 상관을 보인 변수쌍 {n_pairs}개")
                 dl_table(star_out, f"{'Pearson' if cmethod.startswith('Pearson') else 'Spearman'} 상관분석표",
                          "corrstar", "상관분석표")
-                txt = interpret_corr(corr, sel); st.info("💡 " + txt)
+                txt = interpret_corr(corr, sel)
+                _corr_rep = interp_corr_report(corr, _pmat, sel,
+                                               "Pearson" if cmethod.startswith("Pearson") else "Spearman")
+                show_interp(txt, _corr_rep)
                 fig, ax = plt.subplots(figsize=(1.2*len(sel), 1.0*len(sel)))
                 from matplotlib.colors import LinearSegmentedColormap
                 _corr_cmap = LinearSegmentedColormap.from_list(
@@ -7584,13 +8792,17 @@ elif menu == "📊 통계분석":
                 out = corr.round(3).reset_index().rename(columns={"index": "변수"})
                 dl_table(out, "상관분석 결과표", "corr2", "corr")
                 log_action(f"상관분석: {len(sel)}개 변수")
-                report_capture("cap_corr", "상관분석", txt, out, png)
+                report_capture("cap_corr", "상관분석", _corr_rep, out, png,
+                               blocks=[{"text": _corr_rep},
+                                       {"caption": "상관계수표 (유의성 별표 포함)", "table": star_out},
+                                       {"caption": "상관계수 히트맵", "image": png}])
         report_button("cap_corr")
 
     # ---------- 분산분석 ----------
     if tab_anova.on:
         st.subheader("분산분석(ANOVA)")
         with st.expander("ℹ️ 이 분석이 뭔가요?"): st.markdown(EXPLAIN["anova"])
+        summary_rows_notice(df, "anova")
         mode = st.radio("분석 방식", ["일원배치 (요인 1개)", "이원배치 (요인 2개 + 상호작용)",
                                    "🌾 분할구법 (Split-plot)",
                                    "🔁 반복측정 (같은 개체 시기별 조사)", "🎚️ 공분산분석(ANCOVA)",
@@ -7610,6 +8822,12 @@ elif menu == "📊 통계분석":
                 dec = c3.selectbox("소수점 자릿수", [0, 1, 2, 3], index=1, key="ms_dec")
                 show_ns = c4.checkbox("유의차 없으면 문자 생략", value=True,
                                       help="ANOVA에서 p≥0.05인 항목은 문자를 붙이지 않습니다.")
+                # 일원배치 화면과 같게, 난괴법이면 반복(블록)을 모형에 넣어 오차와 유의성 문자를 계산한다.
+                _ms_bopts = ["(없음 · 완전임의배치)"] + [c for c in df.columns if c != gc and c not in traits]
+                ms_blk = st.selectbox("반복(블록) 열 — 난괴법이면 반드시 선택", _ms_bopts,
+                                      index=guess_idx(_ms_bopts, ["반복", "블록", "구역", "block", "rep"]),
+                                      key="ms_blk")
+                ms_blk = None if ms_blk.startswith("(없음") else ms_blk
                 if traits and keep_running("summary", "요약표 만들기"):
                     rows, notes = [], []
                     groups_order = None
@@ -7618,10 +8836,10 @@ elif menu == "📊 통계분석":
                     # 각 그래프에는 평균값 + SD/SE 오차막대 + 유의성 문자(a,b,c)를 표시한다.
                     plot_records = []
                     for tr in traits:
-                        data = df[[gc, tr]].dropna()
+                        data = df[[gc, tr] + ([ms_blk] if ms_blk else [])].dropna()
                         if data[gc].nunique() < 2: continue
                         try:
-                            model = ols(safe_formula(tr, [gc]), data=data).fit()
+                            model = ols(safe_formula(tr, [gc] + ([ms_blk] if ms_blk else [])), data=data).fit()
                             pval = sm.stats.anova_lm(model, typ=2)["PR(>F)"].iloc[0]
                         except Exception:
                             pval = np.nan
@@ -7646,7 +8864,7 @@ elif menu == "📊 통계분석":
                             else:
                                 col[g] = "-"
                         result[tr] = col
-                        notes.append({"항목": tr, "p-value": ("-" if np.isnan(pval) else round(pval, 4)),
+                        notes.append({"항목": tr, "p-value": _pcell(pval, 4),
                                       "유의성": "-" if np.isnan(pval) else ("**" if pval < .01 else "*" if pval < .05 else "n.s.")})
 
                         # ---- 여러 형질 모드: 항목별 화면 그래프 ----
@@ -7698,14 +8916,14 @@ elif menu == "📊 통계분석":
                                     f"anova_multi_{_i+1}.png", "image/png",
                                     key=f"ms_plot_dl_{_i}", width="stretch")
 
-                    txt = (f"{gc}에 따라 {len(traits)}개 형질을 {ph}로 분석했습니다. "
-                           "같은 문자를 가진 처리구끼리는 통계적 차이가 없습니다. "
-                           f"(유의: {(ndf['유의성'] != 'n.s.').sum()}개 항목)")
-                    st.info("💡 " + txt)
+                    txt, _ms_rep = interp_multi_summary(gc, ph, notes, df, traits)
+                    show_interp(txt, _ms_rep)
                     dl_table(summary, f"{gc}별 생산력 검정 결과 ({ph})", "summary_table3", "summary_table")
-                    log_action(f"요약표 생성: {gc} × {len(traits)}개 형질 ({ph})")
+                    log_action(f"요약표 생성(분산분석 ANOVA): {gc} × {len(traits)}개 형질 ({ph})"
+                               + (f" 난괴법 블록 {ms_blk}" if ms_blk else ""))
 
                     _ms_blocks = [
+                        {"text": _ms_rep},
                         {"caption": "처리구별 형질 요약표", "table": summary},
                         {"caption": "항목별 분산분석 유의성", "table": ndf},
                     ]
@@ -7714,7 +8932,7 @@ elif menu == "📊 통계분석":
                          "image": _pr["png"]}
                         for _pr in plot_records
                     ]
-                    report_capture("cap_ms", f"{gc}별 형질 요약표", text=txt, blocks=_ms_blocks)
+                    report_capture("cap_ms", f"{gc}별 형질 요약표", text=_ms_rep, blocks=_ms_blocks)
                     ai_interpret_button("ms", f"{gc}별 여러 형질 요약표", summary,
                                         "각 수치 옆 a,b,c는 처리 간 유의성 그룹입니다.",
                                         capture_slot="cap_ms")
@@ -7774,7 +8992,7 @@ elif menu == "📊 통계분석":
                     else:
                         st.caption("각 처리구의 반복이 3개 미만이라 정규성 검정을 생략했습니다.")
                     if not np.isnan(lp):
-                        st.write(f"등분산(Levene): 통계량={ls:.3f}, p={lp:.3f} → {'만족' if lp >= .05 else '위배'}")
+                        st.write(f"등분산(Levene): 통계량={ls:.3f}, {_ptxt(lp, 3)} → {'만족' if lp >= .05 else '위배'}")
                     else:
                         st.caption("반복이 부족해 등분산 검정을 생략했습니다.")
                     if nok and (np.isnan(lp) or lp >= .05):
@@ -7794,7 +9012,7 @@ elif menu == "📊 통계분석":
                             with st.expander(f"🧪 비모수 대안: {_nm} 결과 보기", expanded=True):
                                 k1, k2 = st.columns(2)
                                 k1.metric("검정 통계량", f"{_st:.3f}")
-                                k2.metric("p-value", f"{_p:.4f}",
+                                k2.metric("p-value", _pcell(_p),
                                           "유의함" if _p < .05 else "유의하지 않음")
                                 smart_table(pd.DataFrame({gc: _med.index.astype(str),
                                                            f"{vc} 중앙값": _med.values}),
@@ -7817,7 +9035,7 @@ elif menu == "📊 통계분석":
                         bkey = f"C({q_ref(blk)})"
                         if bkey in aov.index:
                             bp = aov.loc[bkey, "PR(>F)"]
-                            st.caption(f"블록('{blk}') 효과 p = {bp:.4f} → "
+                            st.caption(f"블록('{blk}') 효과 {_ptxt(bp, 4, spaced=True)} → "
                                        + ("블록 간 차이가 있어 난괴법이 적절했습니다."
                                           if bp < .05 else "블록 간 차이는 뚜렷하지 않았습니다."))
                     _ctrl_for_ph = st.session_state.get("dunnett_ctrl") if ph.startswith("던넷") else None
@@ -7844,7 +9062,7 @@ elif menu == "📊 통계분석":
                         _c0 = st.session_state.get("dunnett_ctrl", "")
                         txt = (f"[{ph}] " + ("처리구 간 유의한 차이가 있습니다"
                                              if pval < .05 else "처리구 간 유의한 차이가 없습니다")
-                               + f" (p = {pval:.4f}). 대조구 '{_c0}'와의 개별 비교는 아래 표를 보세요.")
+                               + f" ({_ptxt(pval, 4, spaced=True)}). 대조구 '{_c0}'와의 개별 비교는 아래 표를 보세요.")
                     else:
                         txt = f"[{ph}] " + interpret_anova(pval, letters)
                     st.info("💡 " + txt)
@@ -7907,12 +9125,12 @@ elif menu == "📊 통계분석":
                                     f"* CV(%) = {ci['CV']:.1f}, 평균±{elabel} "
                                     f"(n = {int(means['count'].min())})")
                     else:
-                        footnote = (f"* 같은 열의 다른 문자는 {_phname}으로 5% 수준에서 "
+                        footnote = (f"* 같은 열의 다른 문자는 {_phname}{_josa(_phname, '으로/로')} 5% 수준에서 "
                                     "유의차가 있음을 나타냄.\n"
                                     f"* CV(%) = {ci['CV']:.1f}, LSD(0.05) = {ci['LSD']:.2f}, "
                                     f"평균±{elabel} (n = {int(means['count'].min())})")
                     st.markdown("###### 📋 표 각주 (복사해서 표 아래에 붙이세요)")
-                    st.code(footnote, language=None)
+                    st.code(footnote, language=None, wrap_lines=True)
                     dl_table(res, f"{gc}별 {vc} 분산분석 ({ph})", "anova4", "anova")
                     log_action(f"일원배치 ANOVA: {gc} × {vc} ({ph})")
                     _anova_ctx = build_anova_context(
@@ -7935,7 +9153,7 @@ elif menu == "📊 통계분석":
                                           context=_anova_ctx, capture_slot="cap_anova")
                     _rep_txt = report_sentence_anova(gc, vc, pval, means, letters, ci, ph)
                     st.markdown("###### 📋 보고서용 결과 문장")
-                    st.code(_rep_txt, language=None)
+                    st.code(_rep_txt, language=None, wrap_lines=True)
                     report_capture("cap_anova", f"{gc}별 {vc} 분산분석", None,
                                    blocks=[{"text": _rep_txt},
                                            {"caption": f"{gc}별 {vc} 분산분석 ({ph})", "table": res,
@@ -7949,18 +9167,27 @@ elif menu == "📊 통계분석":
                 f1 = c1.selectbox("요인 A", cat_cols, key="tw_a")
                 f2 = c2.selectbox("요인 B", [c for c in cat_cols if c != f1], key="tw_b")
                 yv = c3.selectbox("측정값", num_cols, key="tw_y")
+                # 난괴법 요인배치(반복을 블록으로 둔 2요인 시험)는 블록을 모형에 넣어야 오차가 바르게 잡힌다.
+                _tw_bopts = ["(없음 · 완전임의배치)"] + [c for c in cat_cols if c not in (f1, f2)]
+                tw_blk = st.selectbox("반복(블록) 열 — 난괴법 요인배치이면 선택", _tw_bopts,
+                                      index=guess_idx(_tw_bopts, ["반복", "블록", "구역", "block", "rep"]),
+                                      key="tw_blk")
+                tw_blk = None if tw_blk.startswith("(없음") else tw_blk
                 if keep_running("twoway", "이원배치 ANOVA 실행"):
-                    data = df[[f1, f2, yv]].dropna()
-                    model = ols(safe_formula(yv, [f1, f2], interactions=[(f1, f2)]),
+                    data = df[[f1, f2, yv] + ([tw_blk] if tw_blk else [])].dropna()
+                    _cell_n = data.groupby([f1, f2]).size()
+                    if data.empty or (_cell_n.max() if len(_cell_n) else 0) < 2:
+                        st.error("❌ 요인 A×B 조합마다 반복이 2개 이상 있어야 상호작용과 오차를 계산할 수 있습니다. "
+                                 f"지금은 조합당 최대 {int(_cell_n.max()) if len(_cell_n) else 0}개입니다. "
+                                 "반복(블록) 열을 요인으로 고르지 않았는지 확인하세요.")
+                        st.stop()
+                    model = ols(safe_formula(yv, [f1, f2] + ([tw_blk] if tw_blk else []),
+                                             interactions=[(f1, f2)]),
                                 data=data).fit()
                     aov = sm.stats.anova_lm(model, typ=2); out = aov.round(4)
                     smart_table(out, width="stretch")
-                    terms = {f"C({q_ref(f1)})": f"요인A({f1})",
-                             f"C({q_ref(f2)})": f"요인B({f2})",
-                             f"C({q_ref(f1)}):C({q_ref(f2)})": "상호작용"}
-                    txt = " / ".join(f"**{lab}**: {'유의' if aov.loc[k,'PR(>F)']<.05 else '비유의'}(p={aov.loc[k,'PR(>F)']:.3f})"
-                                     for k, lab in terms.items() if k in aov.index)
-                    st.info("💡 " + txt)
+                    txt, _tw_rep = interp_twoway(aov, f1, f2, yv, data, blk=tw_blk)
+                    show_interp(txt, _tw_rep)
                     fig, ax = plt.subplots(figsize=figsize())
                     for lv in data[f2].unique():
                         s = data[data[f2] == lv].groupby(f1)[yv].mean()
@@ -7969,7 +9196,12 @@ elif menu == "📊 통계분석":
                     png = fig_to_png(fig)
                     out2 = out.reset_index().rename(columns={"index": "요인"})
                     dl_table(out2, f"{yv} 이원배치 분산분석", "twoway5", "twoway")
-                    report_capture("cap_tw", f"{yv} 이원배치 분산분석", txt, out2, png)
+                    log_action(f"이원배치 분산분석(ANOVA): {f1} × {f2} → {yv}"
+                               + (f" (난괴법 블록 {tw_blk})" if tw_blk else ""))
+                    report_capture("cap_tw", f"{yv} 이원배치 분산분석", _tw_rep, out2, png,
+                                   blocks=[{"text": _tw_rep},
+                                           {"caption": f"{yv} 이원배치 분산분석표", "table": out2},
+                                           {"caption": f"{f1}×{f2} 상호작용 그래프", "image": png}])
                 report_button("cap_tw")
 
         # ---------- 반복측정 ANOVA ----------
@@ -8034,16 +9266,16 @@ elif menu == "📊 통계분석":
                              "F": "-", "p": "-"},
                             {"요인": f"주구: {main_c}", "자유도": int(a.loc[k_main, "df"]),
                              "제곱합": round(a.loc[k_main, "sum_sq"], 3), "평균제곱": round(ms(k_main), 3),
-                             "F": f"{F_main:.3f}", "p": f"{p_main:.4f}"},
+                             "F": f"{F_main:.3f}", "p": _pcell(p_main)},
                             {"요인": "주구오차(Ea)", "자유도": int(a.loc[k_erra, "df"]),
                              "제곱합": round(a.loc[k_erra, "sum_sq"], 3), "평균제곱": round(ms(k_erra), 3),
                              "F": "-", "p": "-"},
                             {"요인": f"세구: {sub_c}", "자유도": int(a.loc[k_sub, "df"]),
                              "제곱합": round(a.loc[k_sub, "sum_sq"], 3), "평균제곱": round(ms(k_sub), 3),
-                             "F": f"{F_sub:.3f}", "p": f"{p_sub:.4f}"},
+                             "F": f"{F_sub:.3f}", "p": _pcell(p_sub)},
                             {"요인": f"{main_c}×{sub_c}", "자유도": int(a.loc[k_int, "df"]),
                              "제곱합": round(a.loc[k_int, "sum_sq"], 3), "평균제곱": round(ms(k_int), 3),
-                             "F": f"{F_int:.3f}", "p": f"{p_int:.4f}"},
+                             "F": f"{F_int:.3f}", "p": _pcell(p_int)},
                             {"요인": "세구오차(Eb)", "자유도": int(a.loc["Residual", "df"]),
                              "제곱합": round(a.loc["Residual", "sum_sq"], 3), "평균제곱": round(ms_errb, 3),
                              "F": "-", "p": "-"},
@@ -8060,15 +9292,16 @@ elif menu == "📊 통계분석":
                         m2.metric("CV(b) 세구", f"{cvb:.1f} %", cv_grade(cvb))
                         parts = []
                         parts.append(f"주구인 '{main_c}'의 효과는 " +
-                                     (f"유의하였다(p={p_main:.4f})." if p_main < .05 else f"유의하지 않았다(p={p_main:.4f})."))
+                                     (f"유의하였다({_ptxt(p_main, 4)})." if p_main < .05 else f"유의하지 않았다({_ptxt(p_main, 4)})."))
                         parts.append(f"세구인 '{sub_c}'의 효과는 " +
-                                     (f"유의하였다(p={p_sub:.4f})." if p_sub < .05 else f"유의하지 않았다(p={p_sub:.4f})."))
+                                     (f"유의하였다({_ptxt(p_sub, 4)})." if p_sub < .05 else f"유의하지 않았다({_ptxt(p_sub, 4)})."))
                         parts.append("두 요인의 상호작용은 " +
-                                     (f"유의하여 조합별 해석이 필요하다(p={p_int:.4f})." if p_int < .05
-                                      else f"유의하지 않았다(p={p_int:.4f})."))
+                                     (f"유의하여 조합별 해석이 필요하다({_ptxt(p_int, 4)})." if p_int < .05
+                                      else f"유의하지 않았다({_ptxt(p_int, 4)})."))
                         txt = " ".join(parts)
-                        st.info("💡 " + txt)
                         piv = data.pivot_table(index=main_c, columns=sub_c, values=yv, aggfunc="mean").round(rnd())
+                        _sp_rep = interp_splitplot(main_c, sub_c, yv, p_main, p_sub, p_int, piv, cva, cvb)
+                        show_interp(txt, _sp_rep)
                         st.markdown("#### 주구 × 세구 평균")
                         smart_table(piv.reset_index(), width="stretch")
                         fig, ax = plt.subplots(figsize=figsize())
@@ -8076,14 +9309,14 @@ elif menu == "📊 통계분석":
                             ax.plot(piv.index.astype(str), piv[sname], marker="o", label=str(sname))
                         ax.set_xlabel(main_c); ax.set_ylabel(yv)
                         ax.legend(title=sub_c, fontsize=8); deco(ax, f"{main_c} × {sub_c}")
-                        plt.tight_layout(); png = fig_to_png(fig)
+                        fig.tight_layout(); png = fig_to_png(fig)
                         st.download_button("🖼️ 그래프 다운로드", png, "splitplot.png", "image/png")
                         dl_table(sp_tbl, f"{main_c}(주구) × {sub_c}(세구) 분할구 분산분석", "sp1", "splitplot")
                         log_action(f"분할구 분산분석: {main_c} × {sub_c}")
                         ai_interpret_button("sp", f"{main_c}(주구)×{sub_c}(세구) 분할구 분산분석", sp_tbl,
                                             "주구는 주구오차로, 세구는 세구오차로 검정한 결과입니다.", capture_slot="cap_sp")
                         report_capture("cap_sp", f"{main_c}×{sub_c} 분할구 분산분석", None,
-                                       blocks=[{"text": txt},
+                                       blocks=[{"text": _sp_rep},
                                                {"caption": "분할구 분산분석표", "table": sp_tbl},
                                                {"caption": "주구×세구 평균", "table": piv.reset_index(),
                                                 "image": png}])
@@ -8129,6 +9362,9 @@ elif menu == "📊 통계분석":
                                       index=guess_idx(allc, ["시기", "일자", "주차", "조사", "date"]), key="rm_w")
                 yv = c3.selectbox("측정값 열", num_cols, key="rm_y")
                 if keep_running("rm", "반복측정 ANOVA 실행"):
+                    if len({subj, within, yv}) < 3:
+                        st.error("❌ 개체 열·조사 시기 열·측정값 열은 서로 다른 열이어야 합니다.")
+                        st.stop()
                     data = df[[subj, within, yv]].dropna()
                     cnt = data.groupby([subj, within]).size()
                     _balance = validate_repeated_measure_balance(data, subj, within)
@@ -8152,28 +9388,36 @@ elif menu == "📊 통계분석":
                             st.markdown("#### 반복측정 분산분석표")
                             smart_table(tbl, width="stretch")
                             p = float(tbl["Pr > F"].iloc[0])
-                            txt = ("조사 시기에 따라 " +
-                                   (f"측정값이 **유의하게 변화**했습니다 (p = {p:.4f} < 0.05)."
-                                    if p < .05 else f"유의한 변화가 없었습니다 (p = {p:.4f})."))
-                            st.info("💡 " + txt)
-                            st.caption("※ 구형성(sphericity) 가정이 필요합니다. 시기 수가 3개 이상이고 "
-                                       "결과가 경계값(p≈0.05)이면 해석에 주의하세요.")
                             g = data.groupby(within)[yv].agg(["mean", "std", "count"])
                             use_se = st.session_state.get("err_type", "표준편차(SD)").startswith("표준오차")
                             err = (g["std"]/np.sqrt(g["count"])) if use_se else g["std"]
                             res = g.rename(columns={"mean": "평균", "std": "표준편차", "count": "n"}).round(rnd()).reset_index()
+                            # 구형성: Greenhouse-Geisser ε로 자유도를 보정한 p값도 함께 본다(시기 3개 이상).
+                            _eps = gg_epsilon(data, subj, within, yv)
+                            _p_gg = np.nan
+                            if np.isfinite(_eps):
+                                _df1, _df2 = float(tbl["Num DF"].iloc[0]), float(tbl["Den DF"].iloc[0])
+                                _p_gg = float(1 - stats.f.cdf(float(tbl["F Value"].iloc[0]),
+                                                              _df1 * _eps, _df2 * _eps))
+                                st.caption(f"구형성 점검: Greenhouse-Geisser ε = {_eps:.3f} "
+                                           f"(1에 가까울수록 구형성 만족, 0.75 미만이면 보정 p값으로 판단) → 보정 {_ptxt(_p_gg, 4)}")
+                            txt, _rm_rep = interp_rm(within, yv, p, res, _eps, _p_gg)
+                            show_interp(txt, _rm_rep)
                             smart_table(res, width="stretch")
                             fig, ax = plt.subplots(figsize=figsize())
                             ax.errorbar(g.index.astype(str), g["mean"], yerr=err, marker="o",
                                         capsize=4, color=pcolor(), lw=2)
                             ax.set_xlabel(within); ax.set_ylabel(yv)
                             deco(ax, f"시기별 {yv} 변화 (평균±{'표준오차' if use_se else '표준편차'})")
-                            plt.tight_layout(); png = fig_to_png(fig)
+                            fig.tight_layout(); png = fig_to_png(fig)
                             st.download_button("🖼️ 그래프 다운로드", png, "rm.png", "image/png")
                             dl_table(res, f"시기별 {yv} 반복측정 분석", "rm6", "rm")
                             log_action(f"반복측정 ANOVA: {within} × {yv}")
                             ai_interpret_button("rm", f"{yv} 반복측정 분산분석", res, "시기에 따른 변화를 나타냅니다.", capture_slot="cap_rm")
-                            report_capture("cap_rm", f"{yv} 반복측정 분산분석", txt, res, png)
+                            report_capture("cap_rm", f"{yv} 반복측정 분산분석", _rm_rep, res, png,
+                                           blocks=[{"text": _rm_rep},
+                                                   {"caption": f"시기별 {yv} 평균", "table": res},
+                                                   {"caption": f"시기별 {yv} 변화", "image": png}])
                         except Exception as ex:
                             st.error(f"분석 실패: {ex}\n\n자료가 균형적인지(모든 개체 × 모든 시기) 확인해 주세요.")
                 report_button("cap_rm")
@@ -8218,10 +9462,10 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                     ikey = [i for i in a_int.index if ":" in i]
                     p_int = a_int.loc[ikey[0], "PR(>F)"] if ikey else np.nan
                     if not np.isnan(p_int) and p_int < .05:
-                        st.warning(f"⚠️ 처리×공변량 상호작용이 유의합니다 (p={p_int:.4f}). "
+                        st.warning(f"⚠️ 처리×공변량 상호작용이 유의합니다 ({_ptxt(p_int, 4)}). "
                                    "회귀기울기 동일 가정이 깨져 ANCOVA 해석에 주의가 필요합니다.")
                     else:
-                        st.success(f"회귀기울기 동일 가정을 만족합니다 (상호작용 p={p_int:.3f}).")
+                        st.success(f"회귀기울기 동일 가정을 만족합니다 (상호작용 {_ptxt(p_int, 3)}).")
                     model = ols(safe_formula(yv, [gc], covars=[cov]), data=data).fit()
                     aov = sm.stats.anova_lm(model, typ=2)
                     st.markdown("#### 공분산분석표")
@@ -8235,27 +9479,32 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                     res = raw.merge(pred[[gc, "보정평균"]], on=gc)
                     st.markdown("#### 원평균 vs 보정평균")
                     smart_table(res, width="stretch")
-                    st.caption(f"보정평균은 모든 처리구의 '{cov}'가 전체 평균({grand:.2f})으로 같다고 가정했을 때의 값입니다.")
-                    txt = (f"'{cov}'를 보정한 결과 처리구 간 " +
-                           (f"유의한 차이가 있습니다 (p = {p:.4f})." if p < .05
-                            else f"유의한 차이가 없습니다 (p = {p:.4f})."))
-                    st.info("💡 " + txt)
+                    st.caption(f"보정평균은 모든 처리구의 '{cov}'{_josa(cov, '이/가')} 전체 평균({grand:.2f})으로 같다고 가정했을 때의 값입니다.")
+                    txt = (f"'{cov}'{_josa(cov, '을/를')} 보정한 결과 처리구 간 " +
+                           (f"유의한 차이가 있습니다 ({_ptxt(p, 4, spaced=True)})." if p < .05
+                            else f"유의한 차이가 없습니다 ({_ptxt(p, 4, spaced=True)})."))
+                    _ac_rep = interp_ancova(gc, yv, cov, p, p_int, res)
+                    show_interp(txt, _ac_rep)
                     fig, ax = plt.subplots(figsize=figsize())
                     for lv in data[gc].unique():
                         sub = data[data[gc] == lv]
                         ax.scatter(sub[cov], sub[yv], alpha=.7, label=str(lv))
                     ax.set_xlabel(cov); ax.set_ylabel(yv); ax.legend(fontsize=8)
                     deco(ax, f"{cov} 보정 전 관계")
-                    plt.tight_layout(); png = fig_to_png(fig)
+                    fig.tight_layout(); png = fig_to_png(fig)
                     dl_table(res, f"{yv} 공분산분석 보정평균", "ancova7", "ancova")
                     log_action(f"ANCOVA: {gc} × {yv} (공변량 {cov})")
-                    report_capture("cap_ac", f"{yv} 공분산분석", txt, res, png)
+                    report_capture("cap_ac", f"{yv} 공분산분석", _ac_rep, res, png,
+                                   blocks=[{"text": _ac_rep},
+                                           {"caption": f"{gc}별 {yv} 보정평균", "table": res},
+                                           {"caption": f"{cov} 보정 전 관계", "image": png}])
                 report_button("cap_ac")
 
     # ---------- 비모수 ----------
     if tab_np.on:
         st.subheader("비모수 검정")
         with st.expander("ℹ️ 이 분석이 뭔가요?"): st.markdown(EXPLAIN["nonparam"])
+        summary_rows_notice(df, "np")
         if not cat_cols or not num_cols: st.warning("그룹(범주형)과 측정(숫자형) 변수가 필요합니다.")
         else:
             c1, c2 = st.columns(2)
@@ -8264,22 +9513,49 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
             if keep_running("nonparam", "비모수 검정 실행"):
                 data = df[[g, v]].dropna()
                 grp = [data[data[g] == x][v] for x in data[g].unique()]
+                med = data.groupby(g)[v].median().round(3).reset_index(); med.columns = [g, "중앙값"]
+                _np_rep, _ph_pairs, _dunn_tbl = None, None, None
                 if len(grp) >= 3:
                     h, p = stats.kruskal(*grp)
                     st.write(f"**Kruskal-Wallis** (그룹 {len(grp)}개)")
-                    c1, c2 = st.columns(2); c1.metric("H", f"{h:.3f}"); c2.metric("p", f"{p:.4f}")
-                    txt = "Kruskal-Wallis 결과 " + ("그룹 간 유의한 차이가 있습니다." if p < .05 else "차이가 없습니다.")
+                    c1, c2 = st.columns(2); c1.metric("H", f"{h:.3f}"); c2.metric("p", _pcell(p))
+                    # 유의하면 어느 그룹끼리 다른지 Dunn 사후검정(Bonferroni 보정)으로 확인한다.
+                    if p < .05:
+                        try:
+                            _dunn = sp.posthoc_dunn(data, val_col=v, group_col=g, p_adjust="bonferroni")
+                            _labs = list(_dunn.index)
+                            _rows = []
+                            _ph_pairs = []
+                            for _i, _a in enumerate(_labs):
+                                for _b in _labs[_i + 1:]:
+                                    _pp = float(_dunn.loc[_a, _b])
+                                    _rows.append({"그룹1": _a, "그룹2": _b, "p(보정)": _pcell(_pp),
+                                                  "판정": "유의(*)" if _pp < .05 else "n.s."})
+                                    if _pp < .05:
+                                        _ph_pairs.append((_a, _b))
+                            _dunn_tbl = pd.DataFrame(_rows)
+                        except Exception:
+                            _ph_pairs, _dunn_tbl = None, None
+                    txt, _np_rep = interp_nonparam("Kruskal-Wallis", g, v, h, p, med, _ph_pairs)
                 elif len(grp) == 2:
                     u, p = stats.mannwhitneyu(grp[0], grp[1])
                     st.write("**Mann-Whitney U**")
-                    c1, c2 = st.columns(2); c1.metric("U", f"{u:.1f}"); c2.metric("p", f"{p:.4f}")
-                    txt = "Mann-Whitney U 결과 " + ("두 그룹 간 유의한 차이가 있습니다." if p < .05 else "차이가 없습니다.")
-                else: txt = ""
-                st.info("💡 " + txt)
-                med = data.groupby(g)[v].median().round(3).reset_index(); med.columns = [g, "중앙값"]
+                    c1, c2 = st.columns(2); c1.metric("U", f"{u:.1f}"); c2.metric("p", _pcell(p))
+                    txt, _np_rep = interp_nonparam("Mann-Whitney U", g, v, u, p, med)
+                else:
+                    txt = "그룹이 2개 이상이어야 비모수 검정을 할 수 있습니다."
+                show_interp(txt, _np_rep)
                 smart_table(med, width="stretch")
+                if _dunn_tbl is not None:
+                    st.markdown("###### Dunn 사후검정 (Bonferroni 보정)")
+                    smart_table(_dunn_tbl, width="stretch", hide_index=True)
                 dl_table(med, f"{g}별 {v} 중앙값(비모수)", "np8", "np")
-                report_capture("cap_np", f"{g}별 {v} 비모수 검정", txt, med, None)
+                log_action(f"비모수 검정: {g} × {v}")
+                _np_blocks = [{"text": _np_rep or txt}, {"caption": f"{g}별 {v} 중앙값", "table": med}]
+                if _dunn_tbl is not None:
+                    _np_blocks.append({"caption": "Dunn 사후검정(Bonferroni 보정)", "table": _dunn_tbl})
+                report_capture("cap_np", f"{g}별 {v} 비모수 검정", _np_rep or txt, med, None,
+                               blocks=_np_blocks)
             report_button("cap_np")
 
     # ---------- PCA ----------
@@ -8294,8 +9570,9 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                 data = df[feats].dropna()
                 Xs = StandardScaler().fit_transform(data)
                 pca = PCA(n_components=2).fit(Xs); sc_ = pca.transform(Xs); evr = pca.explained_variance_ratio_
-                txt = f"주성분 2개가 원본 정보의 {evr.sum()*100:.1f}%를 설명합니다 (PC1 {evr[0]*100:.1f}%, PC2 {evr[1]*100:.1f}%)."
-                st.info("💡 " + txt)
+                load = pd.DataFrame(pca.components_.T, columns=["PC1", "PC2"], index=feats).round(3).reset_index().rename(columns={"index": "변수"})
+                txt, _pca_rep = interp_pca(evr, load)
+                show_interp(txt, _pca_rep)
                 fig, ax = plt.subplots(figsize=figsize(h=float(st.session_state.get("fig_h",4.0))+1))
                 if cby != "(없음)":
                     cats = df.loc[data.index, cby]
@@ -8309,10 +9586,13 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                 deco(ax, "PCA 산점도"); ax.axhline(0, color="gray", lw=.5); ax.axvline(0, color="gray", lw=.5)
                 png = fig_to_png(fig)
                 st.download_button("🖼️ PCA 그래프", png, "pca.png", "image/png")
-                load = pd.DataFrame(pca.components_.T, columns=["PC1", "PC2"], index=feats).round(3).reset_index().rename(columns={"index": "변수"})
                 smart_table(load, width="stretch")
                 dl_table(load, "PCA 로딩 결과", "pca9", "pca")
-                report_capture("cap_pca", "주성분분석(PCA)", txt, load, png)
+                log_action(f"주성분분석(PCA): {len(feats)}개 변수")
+                report_capture("cap_pca", "주성분분석(PCA)", _pca_rep, load, png,
+                               blocks=[{"text": _pca_rep},
+                                       {"caption": "주성분 적재값(PC1·PC2)", "table": load},
+                                       {"caption": "PCA 산점도", "image": png}])
             report_button("cap_pca")
 
     # ---------- 회귀 ----------
@@ -8327,11 +9607,26 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                 xs = st.multiselect("독립변수 (X)", [c for c in num_cols if c != y], key="lin_x")
                 if xs and keep_running("reg", "회귀분석 실행"):
                     data = df[[y]+xs].dropna()
+                    if len(data) <= len(xs) + 1:
+                        st.error(f"❌ 결측을 뺀 자료가 {len(data)}개뿐이라 독립변수 {len(xs)}개로 회귀분석을 할 수 없습니다. "
+                                 "변수를 줄이거나 자료를 늘려 주세요.")
+                        st.stop()
                     model = sm.OLS(data[y], sm.add_constant(data[xs])).fit()
-                    txt = f"이 모델은 '{y}'의 변동을 약 {model.rsquared*100:.1f}% 설명합니다 (R²={model.rsquared:.3f})."
-                    st.info("💡 " + txt); st.text(model.summary())
-                    coef = pd.DataFrame({"변수": model.params.index, "계수": model.params.values.round(4),
-                                         "p-value": model.pvalues.values.round(4)})
+                    coef, txt, _reg_report, _reg_cautions = interp_regression(model, y, xs, data)
+                    _m1, _m2, _m3, _m4 = st.columns(4)
+                    _m1.metric("R²", f"{model.rsquared:.3f}")
+                    _m2.metric("수정 R²", f"{model.rsquared_adj:.3f}")
+                    _m3.metric("모형 유의성", _ptxt(model.f_pvalue, 4))
+                    _m4.metric("표본 수(n)", f"{int(model.nobs)}")
+                    st.markdown("#### 회귀계수표")
+                    smart_table(coef, width="stretch", hide_index=True)
+                    st.caption("* p<0.05, ** p<0.01, *** p<0.001, n.s. 유의하지 않음 ／ "
+                               "표준화계수(β)는 단위가 다른 변수끼리 영향력을 비교할 때 씁니다.")
+                    show_interp(txt, _reg_report)
+                    for _c in _reg_cautions:
+                        st.warning("⚠️ " + _c)
+                    with st.expander("📄 상세 결과 (statsmodels 원문)"):
+                        st.text(model.summary())
                     if len(xs) >= 2:
                         try:
                             from statsmodels.stats.outliers_influence import variance_inflation_factor
@@ -8368,10 +9663,10 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                         deco(axs[0], "잔차 vs 예측값")
                         stats.probplot(resid, dist="norm", plot=axs[1])
                         axs[1].set_title("정규 Q-Q 도표", fontsize=11)
-                        plt.tight_layout(); show_plot(fg, max_width=920); plt.close(fg)
+                        fg.tight_layout(); show_plot(fg, max_width=920); plt.close(fg)
                         try:
                             _w, _p = stats.shapiro(resid)
-                            st.caption(f"잔차 정규성(Shapiro-Wilk) p = {_p:.4f} → "
+                            st.caption(f"잔차 정규성(Shapiro-Wilk) {_ptxt(_p, 4, spaced=True)} → "
                                        + ("만족 ✅ 모형이 적절합니다."
                                           if _p >= .05 else
                                           "위배 ⚠️ 변수 변환이나 다른 모형을 고려해 보세요."))
@@ -8380,23 +9675,62 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                         st.caption("왼쪽 그림에서 깔때기·곡선 모양이 보이면 등분산·선형성 가정이 "
                                    "깨진 것입니다. 오른쪽 점들이 직선에 가까울수록 정규성이 좋습니다.")
                     dl_table(coef, f"{y} 회귀분석 결과", "reg10", "reg")
-                    report_capture("cap_reg", f"{y} 회귀분석", txt, coef, png)
+                    log_action(f"회귀분석: {y} ~ {', '.join(map(str, xs))}")
+                    report_capture("cap_reg", f"{y} 회귀분석", _reg_report, coef, png,
+                                   blocks=[{"text": _reg_report},
+                                           {"caption": f"{y} 회귀분석 결과", "table": coef},
+                                           *([{"caption": f"{y} 단순회귀", "image": png}] if png else [])])
                 report_button("cap_reg")
         elif rt.startswith("로지스틱"):
             if not num_cols: st.warning("숫자형 독립변수가 필요합니다.")
             else:
                 y = st.selectbox("종속변수 (Y, 2범주)", df.columns.tolist(), key="log_y")
+                _lv = sorted(df[y].dropna().astype(str).unique().tolist())
+                # '미발병'처럼 부정어가 붙은 값을 잘못 고르지 않도록 정확히 같은 값만 찾는다.
+                _pos_guess = next((i for i, v in enumerate(_lv)
+                                   if v.strip().lower() in ("발병", "예", "yes", "y", "있음", "감염", "사망",
+                                                            "1", "1.0", "true", "양성")),
+                                  len(_lv) - 1 if _lv else 0)
+                pos_label = (st.selectbox("관심 범주 (확률을 구할 값)", _lv, index=_pos_guess, key="log_pos",
+                                          help="예: 발병/미발병이면 '발병'. 결과는 이 값이 나올 오즈(가능성)로 해석합니다.")
+                             if len(_lv) == 2 else None)
                 xs = st.multiselect("독립변수 (X)", [c for c in num_cols if c != y], key="log_x")
                 if xs and keep_running("logit", "로지스틱 회귀 실행"):
                     data = df[[y]+xs].dropna()
                     if data[y].nunique() != 2: st.error("종속변수는 2개의 범주여야 합니다.")
                     else:
-                        yb = pd.factorize(data[y])[0]
-                        clf = LogisticRegression(max_iter=1000).fit(data[xs], yb)
-                        st.metric("정확도(훈련)", f"{accuracy_score(yb, clf.predict(data[xs])):.3f}")
-                        coef = pd.DataFrame({"변수": xs, "계수": clf.coef_[0].round(4)})
-                        smart_table(coef, width="stretch")
+                        # 통계 보고용 로지스틱 회귀는 벌점(정규화) 없는 최대우도 추정(statsmodels Logit)을 쓴다.
+                        # (예전 sklearn 기본값은 L2 벌점이 들어가 계수가 작아지고 p값도 없었다)
+                        yb = (data[y].astype(str) == str(pos_label)).astype(int)
+                        try:
+                            _lres = sm.Logit(yb, sm.add_constant(data[xs].astype(float))).fit(disp=0, maxiter=200)
+                        except Exception as _lex:
+                            st.error(f"❌ 로지스틱 회귀를 추정하지 못했습니다 ({type(_lex).__name__}). "
+                                     "한 변수로 두 범주가 완전히 나뉘거나(완전분리) 자료가 너무 적은 경우입니다. "
+                                     "변수를 줄이거나 자료를 늘려 주세요.")
+                            st.stop()
+                        _acc = float(((_lres.predict(sm.add_constant(data[xs].astype(float))) >= .5).astype(int)
+                                      == yb).mean())
+                        coef, _ltxt, _lrep = interp_logit(_lres, y, xs, pos_label, acc=_acc)
+                        _l1, _l2, _l3 = st.columns(3)
+                        _l1.metric("모형 유의성", _ptxt(_lres.llr_pvalue, 4))
+                        _l2.metric("McFadden R²", f"{_lres.prsquared:.3f}")
+                        _l3.metric("정확도(학습자료)", f"{_acc*100:.1f}%")
+                        smart_table(coef, width="stretch", hide_index=True)
+                        st.caption("오즈비(OR) > 1이면 그 변수가 커질수록 관심 범주가 될 가능성이 커지고, < 1이면 작아집니다. "
+                                   "* p<0.05, ** p<0.01, *** p<0.001")
+                        show_interp(_ltxt, _lrep)
+                        if min(int(yb.sum()), int(len(yb) - yb.sum())) < 10 * len(xs):
+                            st.warning("⚠️ 적은 쪽 범주의 개수가 변수 수에 비해 적습니다(변수당 10개 이상 권장). "
+                                       "계수와 오즈비가 불안정할 수 있습니다.")
+                        with st.expander("📄 상세 결과 (statsmodels 원문)"):
+                            st.text(_lres.summary())
                         dl_table(coef, f"{y} 로지스틱 회귀", "logit11", "logit")
+                        log_action(f"로지스틱 회귀분석: {y} ~ {', '.join(map(str, xs))}")
+                        report_capture("cap_logit", f"{y} 로지스틱 회귀분석", _lrep, coef, None,
+                                       blocks=[{"text": _lrep},
+                                               {"caption": f"{y} 로지스틱 회귀분석 결과", "table": coef}])
+                report_button("cap_logit")
 
         # ---------- 프로빗 (LC50 / LD50) ----------
         else:
@@ -8511,10 +9845,13 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                                     lo = hi = float("nan")
                                 else:
                                     lo, hi = 10 ** (m - 1.96*se_m), 10 ** (m + 1.96*se_m)
+                                # 적합도(Pearson χ²): p<0.05면 자료가 프로빗 직선에서 벗어남(이질성)
+                                _gof_p = (round(float(1 - stats.chi2.cdf(gm.pearson_chi2, gm.df_resid)), 4)
+                                          if gm.df_resid > 0 else "-")
                                 rows.append({"구분": g, "LC50": round(lc50, 3),
                                              "95% 하한": round(lo, 3), "95% 상한": round(hi, 3),
                                              "LC90": round(lc90, 3), "기울기": round(b1, 3),
-                                             "n(농도수)": len(sub)})
+                                             "n(농도수)": len(sub), "적합도 p": _gof_p})
                                 curves[g] = (sub, b0, b1, lc50)
                             except Exception as ex:
                                 rows.append({"구분": g, "LC50": "계산불가", "LC90": "-",
@@ -8536,18 +9873,19 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                             ax.set_xscale("log"); ax.set_xlabel(f"{dose} (로그 눈금)")
                             ax.set_ylabel("사충률(%)"); ax.set_ylim(-5, 105)
                             ax.legend(fontsize=7); deco(ax, "농도-사충률 곡선")
-                            plt.tight_layout(); png = fig_to_png(fig)
+                            fig.tight_layout(); png = fig_to_png(fig)
                             st.download_button("🖼️ 그래프 다운로드", png, "probit.png", "image/png")
                         else:
                             png = None
-                        ok = res[res["LC50"] != "계산불가"]
-                        txt = ("프로빗 분석 결과 LC50은 " +
-                               ", ".join(f"{r['구분']} {r['LC50']}" for _, r in ok.iterrows()) +
-                               " 입니다." if len(ok) else "LC50을 계산할 수 있는 자료가 없습니다.")
-                        st.info("💡 " + txt)
+                        txt, _pr_rep = interp_probit(res)
+                        show_interp(txt, _pr_rep)
+                        st.caption("적합도 p<0.05이면 관측 사충률이 프로빗 곡선에서 벗어난다는 뜻이라 신뢰구간 해석에 주의하세요.")
                         dl_table(res, "프로빗 분석 (LC50/LD50)", "probit12", "probit")
                         log_action("프로빗 분석(LC50) 실행")
-                        report_capture("cap_pr", "프로빗 분석(LC50)", txt, res, png)
+                        report_capture("cap_pr", "프로빗 분석(LC50)", _pr_rep, res, png,
+                                       blocks=[{"text": _pr_rep},
+                                               {"caption": "프로빗 분석 (LC50/LD50)", "table": res},
+                                               *([{"caption": "농도-사충률 곡선", "image": png}] if png else [])])
                         ai_interpret_button("pr", "프로빗 분석(LC50/LD50)", res, "LC50이 작을수록 약효가 강하거나 해충이 민감합니다.", capture_slot="cap_pr")
                 report_button("cap_pr")
 
@@ -8567,7 +9905,7 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
             task = st.radio("문제 유형", ["회귀(연속값 예측)", "분류(범주 예측)"],
                             index=1 if auto_cls else 0)
             if not y_is_num:
-                st.info(f"'{tgt}'은 문자(범주)형이므로 **분류**만 가능합니다.")
+                st.info(f"'{tgt}'{_josa(tgt, '은/는')} 문자(범주)형이므로 **분류**만 가능합니다.")
             elif n_uni <= 10:
                 st.caption(f"'{tgt}'의 값이 {n_uni}종류뿐이라 분류가 자연스럽습니다.")
             _reg_algos = [
@@ -8601,7 +9939,7 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
             if fts and keep_running("ml", "모델 학습"):
                 is_reg = task.startswith("회귀")
                 if is_reg and not y_is_num:
-                    st.error(f"⚠️ '{tgt}'은 문자(범주)형이라 회귀 예측을 할 수 없습니다. "
+                    st.error(f"⚠️ '{tgt}'{_josa(tgt, '은/는')} 문자(범주)형이라 회귀 예측을 할 수 없습니다. "
                              "문제 유형을 '분류(범주 예측)'로 바꾸거나 숫자형 열을 선택하세요.")
                     st.stop()
                 data = df[[tgt] + fts].dropna().copy()
@@ -8631,7 +9969,7 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                     }
                     model = mreg[algo].fit(Xtr, ytr)
                     pred = model.predict(Xte)
-                    s_ = r2_score(yte, pred)
+                    s_ = r2_score(yte, pred) if len(yte) >= 2 else float("nan")
                     st.metric("R² (테스트)", f"{s_:.3f}")
                     txt = f"[{algo}] 테스트 R²는 {s_:.3f}입니다."
                     _saved_classes = None
@@ -8703,10 +10041,13 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                     png = fig_to_png(fig)
                     st.caption(f"※ 중요도 산출 방식: {_imp_method}. 알고리즘 간 중요도 값의 절대크기를 직접 비교하지 마세요.")
                     dl_table(imp, f"{tgt} 예측 변수 중요도", "ml13", "ml")
-                else:
-                    st.info("💡 " + txt)
-
-                report_capture("cap_ml", f"{tgt} 예측 머신러닝({algo})", txt, imp, png)
+                _ml_easy, _ml_rep = interp_ml(algo, tgt, is_reg, s_, len(Xtr), len(Xte), imp, _imp_method)
+                show_interp(_ml_easy if imp is None else None, _ml_rep)
+                log_action(f"머신러닝: {tgt} ({algo})")
+                report_capture("cap_ml", f"{tgt} 예측 머신러닝({algo})", _ml_rep, imp, png,
+                               blocks=[{"text": _ml_rep},
+                                       *([{"caption": f"{tgt} 예측 변수 중요도", "table": imp}] if imp is not None else []),
+                                       *([{"caption": f"변수 중요도 ({algo})", "image": png}] if png else [])])
                 st.session_state["ml_model"] = {
                     "model": model, "feats": fts, "target": tgt, "is_reg": is_reg,
                     "algo": algo, "classes": _saved_classes,
@@ -8718,7 +10059,7 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
             if saved:
                 st.divider()
                 st.markdown("#### 🔮 새 데이터로 예측하기")
-                st.caption(f"학습된 [{saved['algo']}] 모델로 '{saved['target']}'을(를) 예측합니다. "
+                st.caption(f"학습된 [{saved['algo']}] 모델로 '{saved['target']}'{_josa(saved['target'], '을/를')} 예측합니다. "
                            "아래에 값을 입력하세요.")
                 pmode = st.radio("입력 방식", ["직접 입력", "엑셀/CSV 업로드"], horizontal=True, key="ml_pmode")
                 if pmode == "직접 입력":
@@ -8754,7 +10095,7 @@ ANCOVA는 '정식 당시 묘 크기'를 **공변량**으로 넣어 그 영향을
                     st.caption(f"예측할 파일에 **{', '.join(saved['feats'])}** 열이 있어야 합니다.")
                     pf = st.file_uploader("예측할 데이터 (xlsx/csv)", type=["xlsx", "csv"], key="ml_pf")
                     if pf is not None:
-                        newdf = pd.read_csv(pf) if pf.name.endswith(".csv") else pd.read_excel(pf)
+                        newdf = _read_csv_any(pf) if pf.name.lower().endswith(".csv") else pd.read_excel(pf)
                         miss = [f for f in saved["feats"] if f not in newdf.columns]
                         if miss:
                             st.error(f"필요한 열이 없습니다: {', '.join(miss)}")
@@ -8802,7 +10143,7 @@ elif menu == "🧠 AI 도우미":
                     f"[처리·품종별 요약]\n{_general_profiles}\n\n"
                     f"위 데이터를 {fmt} 한국어로 정리해 주세요. 데이터에 근거한 내용만 쓰고, "
                     "통계 검정을 따로 하진 않았으니 단정적 유의성 주장은 피하세요.",
-                    st.session_state.get("api_key"), st.session_state.get("ai_model_g"), max_tokens=1000))
+                    st.session_state.get("api_key"), st.session_state.get("ai_model_g"), max_tokens=2000))
                 ai_disclaimer()
                 log_action("AI 데이터 요약 생성")
     elif amode.startswith("결과"):
@@ -8816,7 +10157,10 @@ elif menu == "🧠 AI 도우미":
 - 처리2가 가장 좋은 이유를 데이터 근거로 설명해줘
 """)
         q = st.text_area("궁금한 점", placeholder="예) 처리구별 수량 차이를 쉽게 설명해줘")
-        if st.button("AI에게 물어보기"):
+        _ask = st.button("AI에게 물어보기")
+        if _ask and not str(q or "").strip():
+            st.warning("질문을 입력한 뒤 눌러 주세요. (입력 후 바깥을 한 번 누르거나 Ctrl+Enter)")
+        elif _ask:
             with st.spinner("AI가 분석 중..."):
                 _question_profiles = build_group_profiles(df, question=q)
                 st.markdown(ai_call(
@@ -8824,7 +10168,7 @@ elif menu == "🧠 AI 도우미":
                     "질문에 쉽고 정확하게 한국어로 답해주세요. 입력에 없는 수치나 유의성을 "
                     f"추측하지 마세요.\n\n{summary}\n\n"
                     f"[질문 관련 처리·품종별 요약]\n{_question_profiles}\n\n질문: {q}",
-                    st.session_state.get("api_key"), st.session_state.get("ai_model_g")))
+                    st.session_state.get("api_key"), st.session_state.get("ai_model_g"), max_tokens=2000))
                 ai_disclaimer()
     else:
         with st.expander("💬 이렇게 입력하세요 (예시)"):
@@ -8854,7 +10198,7 @@ elif menu == "🧠 AI 도우미":
                 st.markdown(ai_call("당신은 농업 실험설계·통계 전문가입니다. 아래 연구계획서와 데이터 구조를 보고 "
                                     "가장 적합한 통계 분석 방법(분산분석 종류, 사후검정, 상관/회귀, 비모수 등)을 "
                                     f"이유와 함께 한국어로 단계별 추천해주세요.\n\n[데이터]\n{summary}\n\n[연구계획서]\n{plan}",
-                                    st.session_state.get("api_key"), st.session_state.get("ai_model_g"), max_tokens=1300))
+                                    st.session_state.get("api_key"), st.session_state.get("ai_model_g"), max_tokens=2000))
                 ai_disclaimer()
                 log_action("AI 연구계획서 기반 통계 추천")
     st.caption("※ AI 응답은 참고용이며, 호출 시 사용량만큼 소액 비용이 발생할 수 있어요.")
@@ -8863,7 +10207,6 @@ elif menu == "🧠 AI 도우미":
 elif menu == "💰 경제성분석":
     st.title("💰 경제성 분석")
     st.info("**경제성 분석이 처음이면 길잡이로 시작하고, 분석방법을 알고 있다면 바로 분석할 수 있습니다.** 필요한 자료와 기준단가는 접어서 확인할 수 있습니다.")
-    st.caption("🧭 경제성 분석 UX v3.6 · 단계형 길잡이 + 간소화 화면 · 2026-08-18 적용")
 
     # ---------------------------------------------------------------- 경제성 분석 시작 화면 / 길잡이
     # 기능을 한꺼번에 펼치지 않고, 처음에는 "길잡이"와 "바로 분석" 두 갈래만 보여준다.
@@ -8871,7 +10214,13 @@ elif menu == "💰 경제성분석":
     def _render_econ_material_guide(expanded=False):
         with st.expander("📚 경제성 분석에 어떤 자료를 준비해야 하나요?", expanded=expanded):
             st.caption("모든 분석에 모든 비용이 필요한 것은 아닙니다. 연구목적에 맞는 자료만 준비하면 됩니다.")
-            _mt1, _mt2, _mt3, _mt4 = st.tabs(["공통자료", "비용 항목", "분석별 자료", "빈 서식"])
+            st.download_button("📥 경제성 분석 입력 양식 받기 (엑셀)", econ_input_template_xlsx(),
+                               "경제성분석_입력양식.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="p_econ_guide_template", width="stretch", type="primary",
+                               help="소득분석·부분예산표·신기술(MRR)에 모두 쓰는 양식입니다. "
+                                    "'작성 안내' 시트에 열마다 단위와 주의사항이 있습니다.")
+            _mt1, _mt2, _mt3 = st.tabs(["공통자료", "비용 항목", "분석별 자료"])
             with _mt1:
                 _base_need = pd.DataFrame([
                     ["처리구·품종·기술명", "무엇과 무엇을 비교했는지", "대조구, 신품종A, 신품종B", "비교 연구면 필수"],
@@ -8932,20 +10281,6 @@ elif menu == "💰 경제성분석":
                             "- 어느 가격·수량부터 손해인지 → **손익분기점**\n"
                             "- 가격·수량 변동에도 버티는지 → **민감도 분석**")
 
-            with _mt4:
-                _tmpl1 = pd.DataFrame(columns=["처리구", "반복", "조사면적(a)", "수량(kg)", "판매단가(원/kg)",
-                                                "종자종묘비", "비료비", "농약비", "수도광열비", "기타재료비",
-                                                "소농구비", "대농구상각비", "영농시설상각비", "수선비", "임차료",
-                                                "위탁영농비", "고용노동비", "자가노동시간"])
-                _tmpl2 = pd.DataFrame(columns=["처리구", "반복", "조사면적(a)", "수량(kg)", "판매단가(원/kg)",
-                                                "신기술추가비용", "절감비용", "추가노동시간"])
-                _tc1, _tc2 = st.columns(2)
-                _tc1.download_button("📥 소득분석 빈 서식 CSV", _tmpl1.to_csv(index=False).encode("utf-8-sig"),
-                                     "경제성_소득분석_빈서식.csv", mime="text/csv",
-                                     key="p_econ_guide_template_income", width="stretch")
-                _tc2.download_button("📥 신기술 비교 빈 서식 CSV", _tmpl2.to_csv(index=False).encode("utf-8-sig"),
-                                     "경제성_신기술비교_빈서식.csv", mime="text/csv",
-                                     key="p_econ_guide_template_partial", width="stretch")
 
     _econ_entry = st.session_state.get("econ_entry_mode")
     if _econ_entry not in ("guide", "direct"):
@@ -9158,27 +10493,26 @@ elif menu == "💰 경제성분석":
                      horizontal=True, key="econ_mode", label_visibility="collapsed")
     st.caption("선택한 분석에 필요한 입력과 결과만 아래에 표시됩니다.")
 
-    with st.expander("🧪 경제성 계산 자가진단 (개발·점검용)", expanded=False):
-        st.caption("면적 환산, 입력 검증, 유동·고정자본 산식, 부분예산, 장기투자 NPV/B·C까지 즉시 점검합니다.")
-        if st.button("자가진단 실행", key="econ_selftest"):
-            _self = run_economic_self_test()
-            smart_table(_self, width="stretch", hide_index=True)
-            _passed = int(_self["결과"].eq("PASS").sum())
-            if _passed == len(_self):
-                st.success(f"✅ {_passed}/{len(_self)}개 핵심 테스트 통과")
-            else:
-                st.error(f"❌ {_passed}/{len(_self)}개 통과 — FAIL 항목을 확인하세요.")
+    if _is_admin_user():   # 개발·점검용 — 관리자 계정에서만 보인다
+        with st.expander("🧪 경제성 계산 자가진단 (개발·점검용)", expanded=False):
+            st.caption("면적 환산, 입력 검증, 유동·고정자본 산식, 부분예산, 장기투자 NPV/B·C까지 즉시 점검합니다.")
+            if st.button("자가진단 실행", key="econ_selftest"):
+                _self = run_economic_self_test()
+                smart_table(_self, width="stretch", hide_index=True)
+                _passed = int(_self["결과"].eq("PASS").sum())
+                if _passed == len(_self):
+                    st.success(f"✅ {_passed}/{len(_self)}개 핵심 테스트 통과")
+                else:
+                    st.error(f"❌ {_passed}/{len(_self)}개 통과 — FAIL 항목을 확인하세요.")
     with st.expander("💾 기준단가 관리 (노임·자재비·임차료 등)", expanded=False):
         st.caption("여기에 저장한 값이 아래 분석의 **기본값으로 자동 입력**됩니다. "
                    "기관에서 쓰는 공식 단가를 한 번 넣어두면 매번 입력할 필요가 없어요.")
         if st.session_state.get("price_db") is None:
             st.session_state["price_db"] = default_price_db()
-        else:   # 옛 형식(메타데이터 없는 표)이면 빠진 열을 채움
+        else:   # 옛 형식이면 빠진 열은 채우고, 더 이상 쓰지 않는 열은 지운다
             _pdb = st.session_state["price_db"]
-            import datetime as _dt
-            for _c, _dv in [("조회방식", "사용자 입력"),
-                            ("갱신일", _dt.date.today().isoformat()),
-                            ("환산식", ""), ("사용자수정", False)]:
+            _pdb = _pdb.drop(columns=[c for c in _PRICE_DB_OBSOLETE_COLS if c in _pdb.columns])
+            for _c, _dv in [("조회방식", "사용자 입력"), ("사용자수정", False)]:
                 if _c not in _pdb.columns:
                     _pdb[_c] = _dv
             st.session_state["price_db"] = _pdb
@@ -9191,209 +10525,38 @@ elif menu == "💰 경제성분석":
                               st.session_state["price_db"].to_csv(index=False).encode("utf-8-sig"),
                               "기준단가.csv", width="stretch")
         _up = pcol2.file_uploader("📤 기준단가 불러오기(CSV)", type=["csv"], key="price_up")
-        if _up is not None:
+        # 올린 파일은 화면을 다시 그려도 계속 남아 있으므로, 같은 파일은 한 번만 읽는다.
+        # (예전에는 읽을 때마다 st.rerun()을 불러 무한히 다시 그려졌다)
+        _up_sig = (getattr(_up, "file_id", None) or (getattr(_up, "name", ""), getattr(_up, "size", 0))) if _up is not None else None
+        if _up is not None and st.session_state.get("_price_up_sig") != _up_sig:
             try:
-                st.session_state["price_db"] = pd.read_csv(_up)
+                st.session_state["price_db"] = _read_csv_any(_up)
+                st.session_state["_price_up_sig"] = _up_sig
                 st.success("기준단가를 불러왔습니다."); st.rerun()
             except Exception as ex:
                 st.error(f"불러오기 실패: {ex}")
         st.markdown("---")
-        st.markdown("###### 🌐 KAMIS 농산물 가격 자동 조회 (선택)")
-        st.caption("KAMIS 오픈API 인증키가 있으면 최근 가격을 자동으로 불러올 수 있습니다. "
-                   "발급: kamis.or.kr → 고객센터 → Open-API 이용안내 (무료)")
-        kc1, kc2 = st.columns(2)
-        k_key = kc1.text_input("KAMIS 인증키 (cert_key)", type="password", key="kamis_key")
-        k_id = kc2.text_input("KAMIS 아이디 (cert_id)", key="kamis_id")
-        kc3, kc4, kc5 = st.columns(3)
-        _ITEMS = {"건고추": ("312", "300", "01"), "풋고추": ("225", "200", "01"),
-                  "마늘": ("258", "200", "00"), "양파": ("245", "200", "00"),
-                  "배추": ("211", "200", "00"), "무": ("231", "200", "00"),
-                  "사과": ("411", "400", "05"), "쌀": ("111", "100", "01")}
-        k_item = kc3.selectbox("품목", list(_ITEMS.keys()), key="kamis_item")
-        k_rank = kc4.selectbox("등급", ["04 (상품)", "05 (중품)"], key="kamis_rank")
-        k_days = kc5.number_input("최근 며칠", 1, 30, 7, key="kamis_days")
-        km1, km2 = st.columns(2)
-        k_market = km1.radio("가격 유형", ["도매", "소매"], horizontal=True, key="kamis_market")
-        _COUNTRIES = {"전체": "", "서울": "1101", "부산": "2100", "대구": "2200",
-                      "광주": "2401", "대전": "2501", "안동": "3714", "포항": "3711"}
-        k_country_name = km2.selectbox("지역", list(_COUNTRIES), key="kamis_country")
-        if st.button("📡 KAMIS 가격 조회", width="stretch"):
-            if not (k_key and k_id):
-                st.warning("인증키와 아이디를 모두 입력하세요.")
-            else:
-                code, category, kind = _ITEMS[k_item]
-                with st.spinner("KAMIS에서 가격을 불러오는 중..."):
-                    dfk, err = kamis_fetch(
-                        k_key, k_id, code, kind, k_rank.split()[0], int(k_days),
-                        country_code=_COUNTRIES[k_country_name], category_code=category,
-                        market_type=k_market, convert_kg=False)
-                if err:
-                    st.error(err)
-                    st.caption("품목·등급 조합에 따라 자료가 없을 수 있습니다. "
-                               "KAMIS 홈페이지에서 코드를 확인해 주세요.")
-                else:
-                    _tr = getattr(dfk, "attrs", {}).get("kamis_transport")
-                    if _tr == "http-fallback":
-                        st.warning("⚠️ HTTPS 연결이 실패하여 공식 HTTP 호환 endpoint로 조회했습니다. "
-                                   "KAMIS 서버의 SSL 상태가 정상화되면 자동으로 HTTPS를 다시 사용합니다.")
-                    elif _tr == "https-legacy":
-                        st.info("ℹ️ KAMIS 서버가 구형 TLS 설정을 사용하고 있어 호환 모드로 조회했습니다. "
-                                "인증서 검증은 정상적으로 수행되었습니다.")
-                    elif _tr == "https-insecure":
-                        st.warning("⚠️ KAMIS 서버 인증서를 검증할 수 없어 검증을 생략하고 조회했습니다. "
-                                   "가격 자료 확인 용도로만 사용하고, 인증키가 노출될 수 있는 환경에서는 "
-                                   "수동 입력을 권장합니다.")
-                    st.session_state["kamis_result"] = dfk
-        if st.session_state.get("kamis_result") is not None:
-            _kres = st.session_state["kamis_result"]
-            smart_table(_kres, width="stretch", hide_index=True)
-            _valid = _kres.dropna(subset=["가격"])
-            if len(_valid):
-                st.markdown("###### 📥 조회 결과를 기준단가에 반영")
-                _rowsel = st.selectbox(
-                    "반영할 행", list(range(len(_valid))),
-                    format_func=lambda i: (f"{_valid.iloc[i]['기준일']} · "
-                                           f"{_valid.iloc[i]['품목']} {_valid.iloc[i]['품종']} · "
-                                           f"{_valid.iloc[i]['가격']:,.0f}원 / "
-                                           f"{_valid.iloc[i]['단위']}"),
-                    key="kamis_rowsel")
-                _row = _valid.iloc[_rowsel]
-                _kgf = _row["kg환산계수"]
-                if pd.isna(_kgf) or not _kgf:
-                    st.error(f"❌ 단위 '{_row['단위']}'는 kg으로 환산할 수 없습니다. "
-                             "경제성 분석 단가로 자동 적용하지 않습니다. "
-                             "포장 단위를 확인한 뒤 직접 입력해 주세요.")
-                else:
-                    _per_kg = float(_row["가격"]) / float(_kgf)
-                    st.info(f"환산: {_row['가격']:,.0f}원 ÷ {_kgf:g}kg = "
-                            f"**{_per_kg:,.0f}원/kg** (근거: 단위 '{_row['단위']}')")
-                    _iname = st.text_input("기준단가 항목 이름",
-                                           value=f"{_row['품목']} {_row['품종']}".strip(),
-                                           key="kamis_itemname")
-                    _existing = st.session_state["price_db"]["항목"].astype(str).eq(_iname).any()
-                    _apply_mode = st.radio(
-                        "같은 이름이 있을 때", ["기존값 유지", "새 값으로 교체", "새 이름으로 추가"],
-                        horizontal=True, key="kamis_apply_mode",
-                        disabled=not _existing) if _existing else "새 이름으로 추가"
-                    if st.button("➕ 기준단가에 반영", key="kamis_apply"):
-                        if _existing and _apply_mode == "기존값 유지":
-                            st.info("기존값을 유지했습니다.")
-                            st.stop()
-                        import datetime as _dt
-                        _db = st.session_state["price_db"].copy()
-                        _new = {"항목": _iname, "단가": round(_per_kg, 2), "단위": "원/kg",
-                                "기준연도": str(_row["기준일"])[:4], "기준일": str(_row["기준일"]), "출처": str(_row["출처"]),
-                                "조회방식": "KAMIS",
-                                "갱신일": _dt.date.today().isoformat(),
-                                "환산식": f"{_row['가격']:,.0f}원 ÷ {_kgf:g}kg",
-                                "사용자수정": False}
-                        if "기준일" not in _db.columns:
-                            _db["기준일"] = ""
-                        _final_name = _iname
-                        if _existing and _apply_mode == "새 이름으로 추가":
-                            _final_name = f"{_iname} ({_row['기준일']})"
-                            _new["항목"] = _final_name
-                        _hit = _db.index[_db["항목"].astype(str) == _final_name]
-                        if len(_hit) and _apply_mode == "새 값으로 교체":
-                            st.warning(f"'{_final_name}' 항목을 "
-                                       f"기존 {_db.loc[_hit[0], '단가']} → 새 값 {_new['단가']}로 "
-                                       "덮어씁니다.")
-                            for k, v in _new.items():
-                                if k in _db.columns:
-                                    _db.loc[_hit[0], k] = v
-                        else:
-                            _db = pd.concat([_db, pd.DataFrame([_new])], ignore_index=True)
-                        st.session_state["price_db"] = _db
-                        log_action(f"KAMIS 단가 반영: {_final_name}")
-                        st.success("기준단가에 반영했습니다."); st.rerun()
-            st.caption("조회 결과를 그대로 덮어쓰지 않고, 위에서 확인 후 반영합니다.")
-
-        st.markdown("---")
-        st.markdown("###### 📊 KOSIS 통계 자동 조회 (농업노임·가격지수)")
-        st.caption("통계청 국가통계포털(KOSIS) 인증키가 있으면 농촌 일용노임·농가구입가격지수를 "
-                   "자동으로 받아올 수 있습니다. 발급: kosis.kr/openapi → 회원가입 → 활용신청(자동승인, 무료)")
-        with st.expander("📖 사용법 (처음이라면 꼭 읽어보세요)"):
-            st.markdown("""
-**가장 쉬운 방법 — KOSIS에서 주소 복사해 오기**
-
-1. KOSIS(kosis.kr)에서 원하는 통계표를 찾습니다.
-   예) 통계청 → 농업 → **농가판매및구입가격조사** → 농촌임료금
-2. 표 화면에서 **[OpenAPI]** 버튼을 누릅니다.
-3. 인증키를 선택하면 **요청 주소(URL)**가 만들어집니다. 그 주소를 통째로 복사하세요.
-4. 아래 칸에 붙여넣고 '조회'를 누르면 값이 표로 나옵니다.
-
-**직접 입력하는 방법**
-- 기관코드(orgId): 통계청은 **101**
-- 통계표ID(tblId): KOSIS 통계표 주소에 있는 `DT_...` 형태의 값
-- 시점(prdSe): Y(연간), Q(분기), M(월간)
-""")
-        _kk1, _kk2 = st.columns([3, 1])
-        kosis_key = _kk1.text_input("KOSIS 인증키 (직접 입력 방식일 때만 필요)",
-                                    type="password", key="kosis_key")
-        kosis_mode = _kk2.radio("방식", ["주소 붙여넣기", "직접 입력"], key="kosis_mode")
-
-        if kosis_mode == "주소 붙여넣기":
-            _kurl = st.text_input("KOSIS OpenAPI 주소",
-                                  placeholder="https://kosis.kr/openapi/Param/statisticsParameterData.do?method=getList&apiKey=...",
-                                  key="kosis_url")
-            if st.button("📡 KOSIS 조회", width="stretch", key="kosis_go1"):
-                if not _kurl.strip():
-                    st.warning("주소를 붙여넣어 주세요.")
-                else:
-                    with st.spinner("KOSIS에서 자료를 불러오는 중..."):
-                        dfk, err = kosis_fetch_url(_kurl.strip())
-                    if err: st.error(err)
-                    else:
-                        st.session_state["kosis_result"] = dfk
-                        log_action("KOSIS 통계 조회")
-        else:
-            _c1, _c2, _c3, _c4 = st.columns(4)
-            _org = _c1.text_input("기관코드", value="101", key="kosis_org")
-            _tbl = _c2.text_input("통계표ID", placeholder="DT_...", key="kosis_tbl")
-            _prd = _c3.selectbox("시점", ["Y", "Q", "M"], key="kosis_prd")
-            _cnt = _c4.number_input("최근 몇 개", 1, 20, 5, key="kosis_cnt")
-            if st.button("📡 KOSIS 조회", width="stretch", key="kosis_go2"):
-                if not (kosis_key and _tbl.strip()):
-                    st.warning("인증키와 통계표ID를 입력하세요.")
-                else:
-                    _u = kosis_build_url(kosis_key, _org.strip(), _tbl.strip(),
-                                         prd_se=_prd, count=int(_cnt))
-                    with st.spinner("KOSIS에서 자료를 불러오는 중..."):
-                        dfk, err = kosis_fetch_url(_u)
-                    if err: st.error(err)
-                    else:
-                        st.session_state["kosis_result"] = dfk
-                        log_action("KOSIS 통계 조회")
-
-        if st.session_state.get("kosis_result") is not None:
-            _kr = st.session_state["kosis_result"]
-            smart_table(_kr, width="stretch", hide_index=True)
-            st.caption("조회된 값을 위 기준단가 표의 '단가' 칸에 입력해 사용하세요. "
-                       "기준연도도 함께 적어두면 나중에 갱신할 때 편합니다.")
-            if st.button("🗑️ 조회 결과 지우기", key="kosis_clear"):
-                st.session_state["kosis_result"] = None; st.rerun()
 
         st.markdown("""
-**⚠️ 기본값의 기준연도를 반드시 확인하세요.** 표의 '기준연도' 칸을 보고, 최신 자료가 있으면 갱신해 주세요.
+**⚠️ 기본값의 기준연도를 반드시 확인하세요.** 표의 '기준연도' 칸을 보고, 최신 자료가 있으면 위 표에서 직접 고쳐 주세요.
 
-**자동으로 받아올 수 있는 자료**
-- **농산물 가격** : KAMIS 오픈API (위에서 조회 가능, 무료·일별 갱신)
-  또는 공공데이터포털 aT '지역별 품목별 도·소매 가격정보'(승인 대기 없음)
-- **농촌 일용노임 / 농가구입가격지수** : KOSIS 공유서비스 오픈API (kosis.kr/openapi, 무료·분기 갱신)
-  → 통계청 기관코드 101, '농가판매 및 구입가격조사'
-- **농지 임차료** : 농지공간포털·KOSIS·공공데이터포털 (연 1회, 7월 공표)
-- **농기계 임대정보** : 공공데이터포털 표준데이터(15017325, 월 갱신)
+**자료를 찾을 수 있는 곳 (확인 후 직접 입력)**
+- **농산물 판매가격** : 통계청 농가판매가격조사, 농협·공판장 정산 자료 (농가가 실제로 받은 가격 권장)
+  → 도매·소매 가격(aT KAMIS 등)은 농가수취가격보다 높을 수 있으니 주의하세요.
+- **농업노임 / 농가구입가격지수** : 통계청 국가통계포털(KOSIS) '농가판매 및 구입가격조사'
+- **농지 임차료** : 농지공간포털·통계청 농지임차료 조사 (연 1회, 7월 공표)
+- **농기계 임대정보** : 공공데이터포털 표준데이터(15017325), 지역 농기계임대사업소 임대료표
 
 **사람이 직접 확인해 입력해야 하는 자료**
 - **소득조사 산정계수**(자가노력비 평가노임, 자본용역비 이자율, 감가상각 내용연수)
   → 농촌진흥청 「농축산물 소득자료집」 부록, 또는 농산업경영과(063-238-1197) 문의
 - **농협 비료·농약 실판매가** (연 1회, 1월경 공표 / 보조금 적용 실구매가 기준 권장)
 - **위탁영농비 표준단가** → 소득자료집 작목별 경영비 항목 참고
-- **지역별(경북) 노임** → 시군 조사 또는 지역 농협 확인
+- **지역별 노임** → 시군 조사 또는 지역 농협 확인
 
 **공식 자료 출처**
 - 농업노임·소득자료 : 농촌진흥청 「농축산물 소득자료집」 (농사로 경영자료실)
-- 농산물 가격 : KAMIS 농산물유통정보 / 통계청 농가판매가격조사
+- 농산물 가격 : 통계청 농가판매가격조사
 - 비료·자재 가격 : 농협 자재가격 정보
 - 농기계 임차료 : 지역 농기계은행 임대료표
 - 농지 임차료 : 통계청 농지임차료 조사
@@ -9485,10 +10648,14 @@ elif menu == "💰 경제성분석":
                 _pbp = c1_.number_input("단가 (원/수량 1단위)", 0, 100000000, 0, 100,
                                         key="pbd_price",
                                         help="수량 열이 kg이면 원/kg, 상자면 원/상자를 넣으세요.")
+                _dv, _dcol, _dwarn = _area_prefill("pbd_area", df, 0.1, 1000.0)
                 _pba = c2_.number_input("자료 기준면적 (a)", 0.1, 1000.0, 10.0, 0.1,
                                         key="pbd_area",
                                         help="자료가 10a 기준이면 10, 1a(=100㎡) 기준이면 1. "
                                              "10a 기준으로 환산해 계산합니다.")
+                _area_note(c2_, _dv, _dcol, _dwarn)
+                if not _pbp:
+                    c1_.warning("⚠️ 단가를 넣어야 판매수익 증가가 계산됩니다.")
                 _numopt = [c for c in num_cols if c != _pbq]
                 _hour_guess = [c for c in _numopt if looks_like_hours(c)]
                 _pbhour = st.multiselect(
@@ -9503,11 +10670,24 @@ elif menu == "💰 경제성분석":
                         int(get_price("농업노임(남, 시간)", 19190)), 10, key="pbd_wage",
                         help="기준단가 관리에 넣어 둔 값을 기본으로 씁니다. "
                              "여자 노임(15,174원) 등으로 바꿔도 됩니다.")
+                _costopt = [c for c in _numopt if c not in _pbhour]
+                # 비용으로 보이는 열(이름이 '~비'·'~료'로 끝나거나 '비용'이 든 열)을 처음부터 모두 고른다.
+                # 대조구와 값이 같은 비용은 partial_budget_from_data가 건너뛰므로 다 넣어도 된다.
+                def _pb_costlike(c):
+                    nm = re.sub(r"\([^)]*\)", "", str(c)).replace(" ", "")
+                    return ((nm.endswith(("비", "료")) or "비용" in nm)
+                            and not is_excluded_cost(c) and not looks_like_hours(c)
+                            and not any(k in nm for k in ("단가", "가격", "판매가", "수량", "면적")))
                 _pbcost = st.multiselect(
-                    "비용 열 (원 단위 — 신기술 때문에 달라지는 비용만)",
-                    [c for c in _numopt if c not in _pbhour], key="pbd_cost",
-                    help="인건비·자재비·농약비처럼 처리구마다 값이 다른 비용 열을 고릅니다. "
-                         "'합계' 같은 계산 결과 열은 넣지 마세요.")
+                    "비용 열 (원 단위 — 애매하면 모두 넣어도 됩니다)",
+                    _costopt, default=[c for c in _costopt if _pb_costlike(c)], key="pbd_cost",
+                    help="대조구와 값이 같은 비용은 자동으로 빠지고, 달라진 비용만 아래 표에 들어갑니다. "
+                         "단, '합계·경영비·소득' 같은 계산 결과 열은 넣지 마세요(이중 계산).")
+                st.caption("💡 대조구와 값이 같은 비용은 자동으로 빠지고, **달라진 비용만** 아래 표에 들어갑니다.")
+                _pb_dup = [c for c in _pbcost if is_excluded_cost(c)]
+                if _pb_dup:
+                    st.error("❌ 계산 결과(합계) 열이 들어 있어 이중 계산됩니다: "
+                             + ", ".join(map(str, _pb_dup)) + " — 이 열을 빼 주세요.")
                 _odd = [c for c in _pbcost
                         if looks_like_hours(c)
                         or any(k in str(c).replace(" ", "")
@@ -9517,14 +10697,19 @@ elif menu == "💰 경제성분석":
                                + ", ".join(map(str, _odd))
                                + " — 시간 단위면 위 '노동시간 열'로 옮기고, "
                                  "단가·수량이면 빼 주세요.")
-                if st.button("📥 이 조건으로 아래 표 채우기", key="pbd_fill", width="stretch"):
+                if st.button("📥 이 조건으로 아래 표 채우기", key="pbd_fill", width="stretch",
+                             disabled=bool(_pb_dup)):
                     try:
                         _L, _G, _D = partial_budget_from_data(
                             df, _pbg, _pbc, _pbt, _pbq, _pbp,
                             cost_cols=_pbcost, area_a=_pba,
                             hour_cols=_pbhour, wage_per_hour=_pbwage)
+                        _dq_row = _D[_D["구분"] == "수량(10a)"] if "구분" in _D.columns else _D.iloc[0:0]
+                        _no_price = bool(not _pbp and len(_dq_row)
+                                         and abs(float(_dq_row["차이"].iloc[0])) > 1e-9)
                         st.session_state["pb_auto"] = {"loss": _L, "gain": _G, "detail": _D,
-                                                       "control": _pbc, "treated": _pbt}
+                                                       "control": _pbc, "treated": _pbt,
+                                                       "no_price": _no_price}
                         st.session_state["pb_fill_n"] = st.session_state.get("pb_fill_n", 0) + 1
                         st.session_state["pb_demo"] = False
                         st.success(f"'{_pbc}' 대비 '{_pbt}'의 차이를 아래 표에 채웠습니다.")
@@ -9532,6 +10717,9 @@ elif menu == "💰 경제성분석":
                     except Exception as _ex:
                         st.error(f"❌ {_ex}")
                 if st.session_state.get("pb_auto"):
+                    if st.session_state["pb_auto"].get("no_price"):
+                        st.warning("⚠️ 수량 차이는 있지만 단가가 0이라 **판매수익 증가·감소가 표에 들어가지 않았습니다.** "
+                                   "단가를 넣어야 판매수익 증가가 계산됩니다. 단가를 넣고 다시 채워 주세요.")
                     st.markdown("###### 🔎 10a 환산 비교 (자동 채움 근거)")
                     smart_table(st.session_state["pb_auto"]["detail"],
                                  width="stretch", hide_index=True)
@@ -9719,7 +10907,7 @@ elif menu == "💰 경제성분석":
 화면에서 어떤 열이 수량인지 단가인지 골라 주면 됩니다.
 
 **규칙은 딱 세 개입니다.**
-1. **모든 값은 10a(1,000㎡) 기준**으로 적습니다. (30a 포장이면 3으로 나눠서 적기)
+1. **조사구 면적 기준 그대로** 적고, 그 면적을 `조사면적(a)` 열이나 아래 **자료의 기준 면적** 칸에 넣습니다. 프로그램이 10a로 환산합니다. (이미 10a로 환산한 자료면 10)
 2. **비용은 원 단위 숫자**만 적습니다. 쉼표·'원' 글자가 있어도 자동 변환되지만, 빈칸은 0으로 채우세요.
 3. **합계·소득같은 계산 결과 열은 넣지 마세요.** 프로그램이 다시 계산해서 이중으로 잡힙니다.
 """)
@@ -9737,15 +10925,16 @@ elif menu == "💰 경제성분석":
             st.markdown("""
 - **수량 열** → `수량(kg/10a)`, **단가 열** → `단가(원/kg)` 로 고릅니다.
 - **경영비 열** → `종묘비`·`비료비`·`농약비`·`고용노력비` 를 모두 고릅니다.
-- **자가노동시간** 은 자가노력비(= 시간 × 농촌임료금) 계산에 쓰입니다. 없으면 비워도 됩니다.
+- **자가노동시간** 은 자가노력비(= 시간 × 농업노임(시간당)) 계산에 쓰입니다. 없으면 비워도 됩니다.
 - 단가가 처리구마다 같다면 그냥 같은 값을 반복해 적으면 됩니다.
 - 반복(1, 2, …)이 있으면 **처리구 평균**으로 묶어 계산합니다.
 """)
-            st.download_button("📥 이 서식 그대로 내려받기 (CSV)",
-                               _samp_inc.to_csv(index=False).encode("utf-8-sig"),
-                               "소득분석_입력서식.csv", width="stretch",
+            st.download_button("📥 경제성 분석 입력 양식 받기 (엑셀)", econ_input_template_xlsx(),
+                               "경제성분석_입력양식.xlsx", width="stretch",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                key="dl_inc_form")
-            st.caption("내려받아서 우리 시험 숫자로 바꾼 뒤, 왼쪽 사이드바에 다시 올리면 됩니다.")
+            st.caption("소득분석·부분예산표·신기술(MRR)에 같이 쓰는 양식입니다. 우리 시험 숫자로 바꾼 뒤 "
+                       "왼쪽 사이드바에 다시 올리면 되고, 양식의 비목은 경영비로 자동 선택됩니다.")
 
         if suggested:
             st.caption(f"이 작목의 대표 경영비 항목: {', '.join(suggested)}")
@@ -9768,9 +10957,12 @@ elif menu == "💰 경제성분석":
                            index=guess_idx(byp_opts, ["부산물"]), key="e_by")
 
         _ac1, _ac2 = st.columns([1, 2])
+        _av, _acol, _awarn = _area_prefill("e_area", df, 0.1, 10000.0)
         area_val = _ac1.number_input("자료의 기준 면적", 0.1, 10000.0, 10.0, 0.1,
                                      key="e_area",
-                                     help="입력 자료가 몇 a 기준인지 적으세요. 10a면 그대로 둡니다.")
+                                     help="입력 자료가 몇 a 기준인지 적으세요. 10a면 그대로 둡니다. "
+                                          "자료에 '조사면적' 열이 있으면 자동으로 채웁니다.")
+        _area_note(_ac1, _av, _acol, _awarn)
         area_factor = 10.0 / float(area_val) if area_val else 1.0
         if abs(area_factor - 1.0) > 1e-9:
             _ac2.info(f"📐 자료가 {area_val}a 기준이므로 모든 수입·비용을 "
@@ -9798,7 +10990,7 @@ elif menu == "💰 경제성분석":
             st.markdown("**경영비에 합산될 열** (" + str(len(cost_cols)) + "개)\n\n"
                         + (", ".join(map(str, cost_cols)) if cost_cols else "(선택 없음)")
                         + "\n\n**아래에서 따로 계산되는 항목** (위에 중복 선택 금지)\n"
-                        + "- 자가노력비 = 자가노동시간 × 농촌임료금\n"
+                        + "- 자가노력비 = 자가노동시간 × 농업노임(시간당)\n"
                         + "- 유동·고정자본용역비 = 자본액 × 이자율\n"
                         + "- 토지용역비 = 직접 입력값\n\n"
                         + "**제외된 열**: "
@@ -9862,10 +11054,10 @@ elif menu == "💰 경제성분석":
             _lab = ["(없음)"] + [c for c in num_cols if c not in (yq, pr)]
             labor_col = c6.selectbox("자가노동시간 열", _lab,
                                      index=guess_idx(_lab, ["노동시간", "자가노동", "노력시간"]), key="e_l")
-            wage = c7.number_input("농촌임료금 (원/시간)", 0, 200000,
+            wage = c7.number_input("농업노임 (원/시간)", 0, 200000,
                                    int(get_price("농업노임(남, 시간)", 19190)), 500,
                                    key="e_wage",
-                                   help="자가노력비 = 자가노동시간 × 농촌임료금. 연도·지역별 실제 임료금을 입력하세요.")
+                                   help="자가노력비 = 자가노동시간 × 농업노임(시간당). 연도·지역별 실제 노임을 입력하세요.")
             c8, c9 = st.columns(2)
             rate = c9.number_input("자본 이자율 (%)", 0.0, 20.0,
                                    float(get_price("자본이자율", 5.0)), 0.1, key="e_rate")
@@ -9981,8 +11173,8 @@ elif menu == "💰 경제성분석":
             land_type=land_type, source_area_a=area_val)
         if _fixed_input_error:
             _econ_errors.append(_fixed_input_error)
-        if not _unit_confirm:
-            _econ_errors.append("입력 열의 단위를 확인해야 계산할 수 있습니다.")
+        _econ_todo = ([] if _unit_confirm
+                      else ["위 단위 확인란에 체크하면 실행할 수 있습니다."])
         _econ_errors = list(dict.fromkeys(_econ_errors))
         # 계산 엔진(economic_core)은 열 이름에 '임차'가 있으면 토지 임차료로 보고
         # 별도 토지용역비와 중복이라고 알린다. 그러나 '스마트장비임차비'처럼 기계·장비
@@ -10003,8 +11195,10 @@ elif menu == "💰 경제성분석":
         _econ_errors = _kept
         for _err in _econ_errors:
             st.error("❌ " + _err)
+        for _msg in _econ_todo:
+            st.info("☝️ " + _msg)
 
-        if keep_running("econ", "소득분석 실행", disabled=bool(_econ_errors)):
+        if keep_running("econ", "소득분석 실행", disabled=bool(_econ_errors or _econ_todo)):
             st.session_state.pop("cap_econ", None)
             for _key in ["_econ_rowlevel", "_econ_test_소득", "_econ_test_순수익",
                          "_econ_test_수량", "_econ_signature"]:
@@ -10117,10 +11311,10 @@ elif menu == "💰 경제성분석":
                                 "경제성 결과는 관측된 수량·가격·비용의 점추정치이며, "
                                 "소득 차이 자체의 통계적 유의성은 별도로 검정하지 않았습니다.")
                     st.warning(f"{sig_warn} ({yield_src}"
-                               + (f", p = {yield_p:.4f}" if yield_src.startswith("반복") else "") + ")")
+                               + (f", {_ptxt(yield_p, 4, spaced=True)}" if yield_src.startswith("반복") else "") + ")")
                 else:
                     st.success("✅ 수량에서 처리 간 유의한 차이가 확인되었습니다"
-                               + (f" (p = {yield_p:.4f}, {yield_src})." if yield_src.startswith("반복")
+                               + (f" ({_ptxt(yield_p, 4, spaced=True)}, {yield_src})." if yield_src.startswith("반복")
                                   else f" ({yield_src})."))
 
             # 계산 엔진의 원값을 유지하고, 화면 표시 단계에서만 반올림한다.
@@ -10183,7 +11377,7 @@ elif menu == "💰 경제성분석":
             if ctrl != "(없음)":
                 cmask = e[trt].astype(str) == ctrl
                 if not cmask.any():
-                    st.warning(f"⚠️ 대조구 '{ctrl}'을(를) 자료에서 찾지 못해 증수 분석을 생략합니다.")
+                    st.warning(f"⚠️ 대조구 '{ctrl}'{_josa(ctrl, '을/를')} 자료에서 찾지 못해 증수 분석을 생략합니다.")
                 else:
                     def _safe_mean(series):
                         v = pd.to_numeric(series, errors="coerce").mean()
@@ -10307,7 +11501,7 @@ elif menu == "💰 경제성분석":
                                 continue
                             _p = _res.get("anova_p")
                             if _p is not None:
-                                st.metric(f"{_label} ANOVA p", f"{_p:.4f}",
+                                st.metric(f"{_label} ANOVA p", _pcell(_p),
                                           "유의함" if _p < .05 else "유의하지 않음")
                             if _res.get("dunnett") is not None:
                                 smart_table(_res["dunnett"], width="stretch", hide_index=True)
@@ -10333,7 +11527,7 @@ elif menu == "💰 경제성분석":
             inc_txt = ""
             if has_ctrl:
                 st.markdown("#### 4) 대조구 대비 증수 분석 ⭐")
-                st.caption(f"'{ctrl}'을(를) 기준으로 각 처리의 증수 효과와 경제성을 계산했습니다. "
+                st.caption(f"'{ctrl}'{_josa(ctrl, '을/를')} 기준으로 각 처리의 증수 효과와 경제성을 계산했습니다. "
                            "시험연구보고서 경제성 항목에 바로 쓸 수 있는 지표입니다.")
                 mi = [trt, yq, "증수량", "증수율(%)", "총수입증가액", "경영비증가액",
                       "소득증가액", "순수익증가액", "소득지수"]
@@ -10393,7 +11587,7 @@ elif menu == "💰 경제성분석":
             smart_table(_comp_share.round(1).reset_index(), width="stretch")
             _comp_means = comp.mean(axis=0)
             if not _comp_means.empty and _comp_means.notna().any() and float(_comp_means.fillna(0).sum()) > 0:
-                st.caption(f"평균적으로 '{_comp_means.idxmax()}'가 경영비에서 가장 큰 비중을 차지합니다.")
+                st.caption(f"평균적으로 '{_comp_means.idxmax()}'{_josa(_comp_means.idxmax(), '이/가')} 경영비에서 가장 큰 비중을 차지합니다.")
             else:
                 st.caption("모든 경영비가 0이어서 비용 비중을 계산할 수 없습니다.")
 
@@ -10417,7 +11611,7 @@ elif menu == "💰 경제성분석":
             _bc_count = int((_valid_bc > 1).sum())
             _sig_note = ("\n  - " + sig_warn.replace("⚠️ ", "")) if sig_warn else ""
             txt = ("○ 처리구별 경제성 분석 결과\n"
-                   f"  - 소득이 가장 높은 처리구는 '{best}'로 {best_income:,.0f}원/10a"
+                   f"  - 소득이 가장 높은 처리구는 '{best}'{_josa(best, '으로/로')} {best_income:,.0f}원/10a"
                    f"(소득률 {_best_rate_txt})였으며, "
                    f"순수익이 가장 높은 처리구는 '{bestn}'({bestn_profit:,.0f}원/10a)이었다.\n"
                    f"  - 입력한 가격·수량·비용 조건에서 전체 {len(e)}개 처리구 중 "
@@ -10635,7 +11829,7 @@ elif menu == "💰 경제성분석":
             _econ_ctx = build_econ_context(
                 base_area="10a", control=(None if ctrl == "(없음)" else ctrl),
                 treatments=e[_ctx_cols],
-                prices={"농촌임료금(원/시간)": wage, "자본이자율(%)": rate,
+                prices={"농업노임(원/시간)": wage, "자본이자율(%)": rate,
                         "고정자산 부분현재가(원/10a)": fixed_asset,
                         "고정자산 작목부담률(%)": fixed_asset_use_rate,
                         "토지이용형태": land_type,
@@ -10708,7 +11902,9 @@ elif menu == "💰 경제성분석":
         pb_by = st.selectbox("부산물 편익 열 (선택)", _pb_by_opts, key="pb_by")
         _pb_levels = df[trt].dropna().astype(str).unique().tolist()
         pb_control = st.selectbox("기준 처리(관행·대조구)", _pb_levels, key="pb_control")
+        _pv, _pcol, _pwarn = _area_prefill("pb_area", df, 0.1, 10000.0)
         pb_area = st.number_input("부분예산 자료 기준 면적(a)", 0.1, 10000.0, 10.0, 0.1, key="pb_area")
+        _area_note(st, _pv, _pcol, _pwarn)
         c4, c5 = st.columns(2)
         adj = c4.slider("수량 조정률(%)", 0, 30, 10, 5, key="pb_adj",
                        help="시험포장→농가 조건 보정. 보통 10%")
@@ -10722,16 +11918,20 @@ elif menu == "💰 경제성분석":
             _pb_errors.append("처리구 열을 수량 또는 단가 열로 사용할 수 없습니다.")
         if yq == pr:
             _pb_errors.append("수량 열과 단가 열은 서로 달라야 합니다.")
+        # 아직 고르지 않은 항목(할 일)은 오류가 아니라 안내로 보여 준다.
+        _pb_todo = []
         if not var_cols:
-            _pb_errors.append("가변비용 항목을 하나 이상 선택해 주세요.")
+            _pb_todo.append("가변비용 항목을 하나 이상 선택해 주세요.")
         if any(is_excluded_cost(c) for c in var_cols):
             _pb_errors.append("합계·소득·생산비 등 계산 결과 열은 가변비용으로 사용할 수 없습니다.")
         if not _pb_unit_confirm:
-            _pb_errors.append("입력 열의 단위를 확인해야 계산할 수 있습니다.")
+            _pb_todo.append("위 단위 확인란에 체크하면 실행할 수 있습니다.")
         for _msg in _pb_errors:
             st.error("❌ " + _msg)
+        for _msg in _pb_todo:
+            st.info("☝️ " + _msg)
 
-        if keep_running("partbudget", "부분예산 분석 실행", disabled=bool(_pb_errors)):
+        if keep_running("partbudget", "부분예산 분석 실행", disabled=bool(_pb_errors or _pb_todo)):
             st.session_state.pop("cap_pb", None)
             # ⑤ 행(반복)별 계산 → 처리 평균. 순수 함수로 분리해 자동 검산과 UI가 같은 로직을 사용한다.
             try:
@@ -10803,7 +12003,7 @@ elif menu == "💰 경제성분석":
             _ctrl_dom = (str(_ctrl_rows.iloc[0]["지배"]) if len(_ctrl_rows) else "기준 처리 없음")
             if _ctrl_dom:
                 _start = und.iloc[0][trt] if len(und) else "없음"
-                txt = (f"선택한 기준 처리 '{pb_control}'은 지배분석에서 {_ctrl_dom}로 분류되었습니다. "
+                txt = (f"선택한 기준 처리 '{pb_control}'{_josa(pb_control, '은/는')} 지배분석에서 {_ctrl_dom}{_josa(_ctrl_dom, '으로/로')} 분류되었습니다. "
                        f"따라서 관행 유지를 자동 권장하지 않으며, 효율경계 시작 처리 '{_start}'부터 "
                        "비용·순편익과 현장 적용성을 다시 검토해야 합니다.")
             elif ok_idx:
@@ -10814,7 +12014,7 @@ elif menu == "💰 경제성분석":
                        "다만 반복수와 가격·수량 민감도도 함께 확인해야 합니다.")
             else:
                 txt = (f"MRR이 기준({minmrr}%)을 넘는 추가 처리 단계가 없습니다. "
-                       f"선택한 기준 처리 '{pb_control}'이 비지배 처리이므로 현재 자료에서는 기준 처리 유지가 "
+                       f"선택한 기준 처리 '{pb_control}'{_josa(pb_control, '이/가')} 비지배 처리이므로 현재 자료에서는 기준 처리 유지가 "
                        "상대적으로 합리적이지만, 통계적 불확실성과 민감도 결과를 함께 확인해야 합니다.")
             st.info("💡 " + txt)
 
@@ -10826,7 +12026,7 @@ elif menu == "💰 경제성분석":
                             xytext=(3, 4), textcoords="offset points")
             ax.set_xlabel("가변비용(원/10a)"); ax.set_ylabel("순편익(원/10a)")
             ax.legend(fontsize=8); deco(ax, "부분예산 효율경계")
-            plt.tight_layout(); png = fig_to_png(fig)
+            fig.tight_layout(); png = fig_to_png(fig)
             st.download_button("🖼️ 그래프 다운로드", png, "mrr.png", "image/png")
             out = und[[c for c in [trt, "가변비용", "순편익", "비용 증가액",
                                    "순편익 증가액", "MRR(%)", "권장 여부 및 근거"]
@@ -10915,10 +12115,11 @@ elif menu == "💰 경제성분석":
                 _inv_sens_show[_c] = _inv_sens_show[_c].map(lambda v: round_half_up(v))
             smart_table(money_table(_inv_sens_show), width="stretch", hide_index=True)
 
+            _bcr_txt = f"{_bcr:.2f}" if pd.notna(_bcr) else "계산 불가"
             _inv_txt = ("○ 시설·장기투자 경제성 분석 결과\n"
                         f"  - 최초투자비 {_initial:,.0f}원, 내용연수 {_life}년, 할인율 {_disc:g}%를 적용하였다.\n"
                         f"  - NPV는 {_npv:,.0f}원, 할인 B/C는 "
-                        f"{(_bcr if pd.notna(_bcr) else float('nan')):.2f}로 산출되었다.\n"
+                        f"{_bcr_txt}{_josa(_bcr_txt, '으로/로')} 산출되었다.\n"
                         + (f"  - IRR은 {_irr:.1f}%로 산출되었다.\n" if pd.notna(_irr)
                            else "  - 현금흐름 구조상 IRR은 계산되지 않았다.\n")
                         + (f"  - 할인 회수기간은 {_dpb:.1f}년이었다.\n" if pd.notna(_dpb)
@@ -11057,8 +12258,8 @@ elif menu == "📋 설문조사 분석":
                             ax.tick_params(colors="#555", labelsize=8)
                             ax.set_title(f"{c}  (n={int(vc.sum())})", fontsize=11,
                                          fontweight="bold", color="#333")
-                            plt.xticks(rotation=20, fontsize=8)
-                            plt.tight_layout()
+                            ax.tick_params(axis="x", labelrotation=20, labelsize=8)
+                            fig.tight_layout()
                         else:
                             fig = pie_chart(vc, c, donut=(chart_style == "도넛"))
                         show_plot(fig); plt.close(fig)
@@ -11195,10 +12396,16 @@ elif menu == "📋 설문조사 분석":
                    f"응답자 특성 {len(demo_q)}개, 객관식 문항 {len(single_q)}개, "
                    f"다중응답 {len(multi)}개, 주관식 {len(openq)}개를 그래프와 함께 분석했습니다.")
             st.success("✅ " + txt)
+            _auto_easy, _auto_rep = interp_survey_auto(
+                rep_blocks, len(df),
+                pos_col=(_pos_col if likert else None), a_=(a_ if likert else None),
+                lvl=(lvl if likert else None), scale_max=(smax if likert else None),
+                likert_summ=(summ if likert else None))
+            show_interp(_auto_easy, _auto_rep)
             if rep_blocks:
                 log_action("설문 자동 인식 분석(그래프)")
                 report_capture("cap_auto", "설문조사 자동 분석",
-                               text=txt, blocks=[{"text": txt}] + rep_blocks)
+                               text=_auto_rep, blocks=[{"text": _auto_rep}] + rep_blocks)
                 _ai_tbl = next((b["table"] for b in rep_blocks
                                 if b.get("table") is not None), None)
                 if _ai_tbl is not None:
@@ -11345,16 +12552,17 @@ elif menu == "📋 설문조사 분석":
             else:
                 top = valid_summ.loc[valid_summ["평균"].idxmax(), "문항"]
                 low = valid_summ.loc[valid_summ["평균"].idxmin(), "문항"]
-            txt = (f"평균이 가장 높은 문항은 '{top}', 가장 낮은 문항은 '{low}'입니다. "
-                   f"전체 신뢰도(크론바흐 α)는 {a_:.3f}로 {lvl} 수준입니다.")
+            txt, _lk_rep = interp_likert(summ, _pos_col, a_, lvl, len(df), scale_max,
+                                         cmp_df if (demo and len(cmp_df)) else None)
+            show_interp(txt, _lk_rep)
             st.download_button("🖼️ 그래프 다운로드", png, "survey.png", "image/png")
             log_action("설문 리커트 분석")
-            blocks = [{"text": txt},
+            blocks = [{"text": _lk_rep},
                       {"caption": "문항별 기술통계", "table": summ, "image": png},
                       {"caption": "문항 제외 시 신뢰도", "table": drop}]
             if demo and len(cmp_df):
                 blocks.append({"caption": "응답자 특성별 차이 검정", "table": cmp_df})
-            report_capture("cap_survey", "설문조사 분석(리커트)", text=txt, blocks=blocks)
+            report_capture("cap_survey", "설문조사 분석(리커트)", text=_lk_rep, blocks=blocks)
             ai_interpret_button("svylk", "설문 리커트 척도 분석", summ,
                                 "평균·표준편차·긍정률과 크론바흐 알파가 있는 표입니다. "
                                 "알파 0.7 이상이면 신뢰할 만하다는 기준을 함께 언급하세요.",
@@ -11382,12 +12590,12 @@ elif menu == "📋 설문조사 분석":
                     fig = pie_chart(vc, c, donut=True)
                     show_plot(fig); plt.close(fig)
             res = pd.concat(all_tbl, ignore_index=True)
-            top = res.loc[res["빈도"].idxmax()]
-            txt = f"가장 많은 응답은 '{top['문항']}'의 '{top['응답']}'({top['비율(%)']}%)입니다."
-            st.info("💡 " + txt)
+            txt, _mc_rep = interp_mc(res, len(df))
+            show_interp(txt, _mc_rep)
             png = fig_to_png(fig, show=False)
             log_action("설문 객관식 분석")
-            report_capture("cap_mc", "설문 객관식 분석", txt, res, png)
+            report_capture("cap_mc", "설문 객관식 분석", _mc_rep, res, png,
+                           blocks=[{"text": _mc_rep, "caption": "설문 객관식 분석", "table": res, "image": png}])
             ai_interpret_button("svymc", "설문 객관식 응답 분포", res,
                                 "빈도(명)와 비율(%)만 있는 표입니다. 통계 검정 결과가 아니므로 "
                                 "'유의하다'는 표현은 쓰지 말고, 응답이 몰린 항목과 그 뜻을 서술하세요.",
@@ -11399,7 +12607,12 @@ elif menu == "📋 설문조사 분석":
     elif stype.startswith("☑️"):
         st.caption("'해당되는 것을 모두 고르세요' 문항처럼 한 칸에 여러 답이 들어간 경우를 분석합니다.")
         c1, c2 = st.columns(2)
-        mcol = c1.selectbox("다중응답 열", df.columns.tolist(), key="mr_c")
+        # 구분자(; , / |)가 들어간 응답이 많은 열을 먼저 보여 준다(예전에는 첫 열 '응답자ID'가 기본 선택).
+        def _mr_score(c):
+            _s = df[c].dropna().astype(str)
+            return -max([_s.str.contains(x, regex=False).mean() for x in (";", ",", "/", "|")] or [0]) if len(_s) else 0
+        _mr_opts = sorted(df.columns.tolist(), key=_mr_score)
+        mcol = c1.selectbox("다중응답 열", _mr_opts, key="mr_c")
         sep = c2.selectbox("구분 기호", [";", ",", "/", "|", " "], key="mr_s")
         if keep_running("svmr", "다중응답 분석 실행"):
             ser = df[mcol].dropna().astype(str)
@@ -11416,11 +12629,11 @@ elif menu == "📋 설문조사 분석":
             ax.barh(t["응답 항목"], t["응답률(%)"], color=bar_colors(values=t["응답률(%)"].tolist())); ax.invert_yaxis()
             ax.set_xlabel("응답률(%)"); deco(ax, f"{mcol} 다중응답")
             png = fig_to_png(fig)
-            txt = (f"가장 많이 선택된 항목은 '{t.iloc[0]['응답 항목']}'로 응답자의 "
-                   f"{t.iloc[0]['응답률(%)']}%가 선택했습니다. (응답률 합계가 100%를 넘는 것은 정상입니다)")
-            st.info("💡 " + txt)
+            txt, _mr_rep = interp_mr(mcol, t, n_resp)
+            show_interp(txt, _mr_rep)
             log_action("설문 다중응답 분석")
-            report_capture("cap_mr", "설문 다중응답 분석", txt, t, png)
+            report_capture("cap_mr", "설문 다중응답 분석", _mr_rep, t, png,
+                           blocks=[{"text": _mr_rep, "caption": "설문 다중응답 분석", "table": t, "image": png}])
             ai_interpret_button("svymr", "설문 다중응답 분석", t,
                                 "다중응답이므로 응답률 합계가 100%를 넘는 것이 정상입니다. "
                                 "이를 오류로 지적하지 마세요.",
@@ -11431,7 +12644,14 @@ elif menu == "📋 설문조사 분석":
     # ---------- 주관식 ----------
     elif stype.startswith("✍️"):
         st.caption("자유롭게 적은 의견을 모아 응답 목록·주요 단어를 확인하고, AI로 요약할 수 있습니다.")
-        tcol = st.selectbox("주관식 열", df.columns.tolist(), key="tx_c")
+        # 글자 수가 긴 응답이 많은 문자 열을 먼저 보여 준다(숫자·ID 열은 뒤로).
+        def _tx_score(c):
+            if pd.api.types.is_numeric_dtype(df[c]):
+                return 0
+            _s = df[c].dropna().astype(str).str.strip()
+            return -float(_s.str.len().mean()) if len(_s) else 0
+        _tx_opts = sorted(df.columns.tolist(), key=_tx_score)
+        tcol = st.selectbox("주관식 열", _tx_opts, key="tx_c")
         if keep_running("svtx", "주관식 분석 실행"):
             ser = df[tcol].dropna().astype(str).str.strip()
             ser = ser[ser != ""]
@@ -11441,12 +12661,12 @@ elif menu == "📋 설문조사 분석":
             st.markdown("#### 의견 목록")
             op_tbl = pd.DataFrame({"번호": range(1, len(ser)+1), "의견": ser.values})
             smart_table(op_tbl, width="stretch", hide_index=True, height=320)
-            txt = (f"주관식 문항 '{tcol}'에 대해 전체 {len(df)}명 중 {len(ser)}명"
-                   f"({len(ser)/max(len(df),1)*100:.1f}%)이 의견을 제시하였다.")
-            st.info("💡 " + txt)
+            txt, _tx_rep = interp_text(tcol, len(df), ser.tolist())
+            show_interp(txt, _tx_rep)
             st.session_state["subj_text"] = "\n".join(f"- {v}" for v in ser.tolist()[:100])
             log_action("설문 주관식 분석")
-            report_capture("cap_tx", "설문 주관식 의견", txt, op_tbl, None)
+            report_capture("cap_tx", "설문 주관식 의견", _tx_rep, op_tbl, None,
+                           blocks=[{"text": _tx_rep, "caption": "설문 주관식 의견", "table": op_tbl}])
         if st.session_state.get("subj_text"):
             st.markdown("#### 🧠 AI로 의견 요약하기 (선택)")
             if st.button("AI 요약 실행"):
@@ -11455,7 +12675,7 @@ elif menu == "📋 설문조사 분석":
                         "다음은 설문조사의 주관식 응답입니다. 주요 의견을 3~5개 주제로 묶어 "
                         "각 주제별 핵심 내용과 대표 의견을 한국어로 정리해 주세요. "
                         "마지막에 개선 우선순위를 제안해 주세요.\n\n" + st.session_state["subj_text"],
-                        st.session_state.get("api_key"), st.session_state.get("ai_model_g"), max_tokens=1200))
+                        st.session_state.get("api_key"), st.session_state.get("ai_model_g"), max_tokens=2000))
                     log_action("AI 주관식 의견 요약")
         report_button("cap_tx")
         survey_download_panel("cap_tx", "text", "설문_주관식분석")
@@ -11464,8 +12684,17 @@ elif menu == "📋 설문조사 분석":
     else:
         st.caption("두 범주형 문항의 관계를 교차표와 카이제곱 검정으로 확인합니다. (예: 소속 × 재사용 의향)")
         c1, c2 = st.columns(2)
-        rowv = c1.selectbox("행 변수", df.columns.tolist(), key="ct_r")
-        colv = c2.selectbox("열 변수", [c for c in df.columns if c != rowv], key="ct_c")
+        # 응답자ID처럼 행마다 값이 다른 열이나 범주가 너무 많은 열은 교차표가 되지 않으므로
+        # 목록 뒤로 보낸다(선택은 여전히 가능). 예전에는 첫 열인 '응답자ID'가 기본 선택됐다.
+        def _ct_unfit(c):
+            _s = df[c].dropna()
+            _nu = _s.nunique()
+            _nm = str(c).lower().replace(" ", "")
+            return bool(len(_s) and (_nu >= len(_s) or _nu > 20
+                                     or any(k in _nm for k in ("id", "번호", "no.", "이름", "성명"))))
+        _ct_opts = sorted(df.columns.tolist(), key=_ct_unfit)
+        rowv = c1.selectbox("행 변수", _ct_opts, key="ct_r")
+        colv = c2.selectbox("열 변수", [c for c in _ct_opts if c != rowv], key="ct_c")
         pct = st.radio("비율 기준", ["빈도만", "행 기준 %", "열 기준 %"], horizontal=True)
         if keep_running("svct", "교차분석 실행"):
             sub = df[[rowv, colv]].dropna()
@@ -11484,6 +12713,7 @@ elif menu == "📋 설문조사 분석":
                             f"({100.0 if pct == '행 기준 %' else ct.loc[r].sum() / _grand * 100:.1f}%)"
                             for r in ct.index]
             smart_table(show, width="stretch")
+            chi2 = p = dof = low = None
             try:
                 chi2, p, dof, exp = stats.chi2_contingency(ct)
                 low = (exp < 5).sum() / exp.size * 100
@@ -11491,13 +12721,11 @@ elif menu == "📋 설문조사 분석":
                     st.warning(f"⚠️ 기대빈도가 5 미만인 칸이 {low:.0f}%입니다(기준 20%). "
                                "카이제곱 결과가 부정확할 수 있으니 범주를 합치거나 Fisher 정확검정을 고려하세요.")
                 c1, c2, c3 = st.columns(3)
-                c1.metric("카이제곱", f"{chi2:.3f}"); c2.metric("자유도", dof); c3.metric("p-value", f"{p:.4f}")
-                txt = (f"'{rowv}'와 '{colv}' 사이에 "
-                       + ("통계적으로 유의한 관련성이 있습니다" if p < .05 else "유의한 관련성이 없습니다")
-                       + f" (χ²={chi2:.2f}, p={p:.4f}).")
-                st.info("💡 " + txt)
+                c1.metric("카이제곱", f"{chi2:.3f}"); c2.metric("자유도", dof); c3.metric("p-value", _pcell(p))
             except Exception as e:
-                txt = "교차표를 생성했습니다."; st.warning(f"카이제곱 검정 불가: {e}")
+                st.warning(f"카이제곱 검정 불가: {e}")
+            txt, _ct_rep = interp_crosstab(rowv, colv, ct, chi2, p, dof, low)
+            show_interp(txt, _ct_rep)
             row_pct = (ct.div(ct.sum(axis=1), axis=0)*100).round(1)  # 막대 라벨은 항상 행 기준 %로 표기
             _w, _h = figsize()
             fig, ax = plt.subplots(figsize=(_w + 1.2, _h))
@@ -11525,17 +12753,31 @@ elif menu == "📋 설문조사 분석":
                 bottoms += vals
             ax.set_ylabel("응답 수"); deco(ax, f"{rowv} × {colv}")
             ax.set_ylim(0, _ymax * 1.05)
-            plt.xticks(rotation=20)
+            ax.tick_params(axis="x", labelrotation=20)
             # 범례를 그림 밖으로 빼서 막대·숫자를 가리지 않게 한다
             ax.legend(title=str(colv), fontsize=7, title_fontsize=8,
                       loc="upper left", bbox_to_anchor=(1.01, 1.0), borderaxespad=0)
-            plt.tight_layout(); png = fig_to_png(fig)
+            fig.tight_layout(); png = fig_to_png(fig)
             if _hidden:
                 st.caption(f"※ 칸이 너무 좁은 {_hidden}곳은 글씨가 겹쳐 숫자를 생략했습니다. "
                            "정확한 값은 위 교차표를 보세요.")
             out = show.reset_index()
             log_action(f"교차분석: {rowv} × {colv}")
-            report_capture("cap_ct", f"{rowv} × {colv} 교차분석", txt, out, png)
+            # 엑셀은 화면용 '12명 (33.3%)' 글자 대신 숫자 표로 저장해야 그래프를 그릴 수 있다.
+            _ct_x = ct.copy()
+            _ct_x.columns = [str(c) for c in _ct_x.columns]
+            _ct_x["합계"] = ct.sum(axis=1).values
+            _ct_x = _ct_x.reset_index()
+            _pct_x = pct_tbl.copy()
+            _pct_x.columns = [f"{c} (%)" for c in _pct_x.columns]
+            _pct_x = _pct_x.reset_index()
+            _pct_name = {"행 기준 %": "행 기준", "열 기준 %": "열 기준"}.get(pct, "전체 대비")
+            _ct_cap = f"{rowv} × {colv} 교차분석"
+            report_capture("cap_ct", _ct_cap, _ct_rep, out, png,
+                           blocks=[{"text": _ct_rep, "caption": _ct_cap, "table": out, "image": png,
+                                    "xlsx_table": _ct_x,
+                                    "xlsx_opts": {"stacked": True, "max_series": 12},
+                                    "xlsx_extra": [(f"비율({_pct_name} %)", _pct_x)]}])
             ai_interpret_button("svyct", f"{rowv} × {colv} 교차분석", out,
                                 f"카이제곱 검정 결과는 다음과 같습니다: {txt} "
                                 "표의 값은 '인원(비율%)' 형식이며 비율은 "
@@ -11551,7 +12793,7 @@ elif menu == "👑 관리자":
 
 elif menu == "📖 사용설명서":
     st.title("📖 사용설명서")
-    _MANUAL = "# 스마트 통계 에이전트 — 사용설명서\n\n농업연구사·지도사를 위한 실험데이터 통계분석 자동화 도구\n\n---\n\n## 1. 웹에서 시작하기\n\n별도 설치 없이 **스마트 통계 에이전트 웹주소에 접속**해서 사용합니다.\n로그인 기능이 켜져 있으면 회원가입/로그인 후 아래 순서대로 진행하세요.\n\n```\n① 데이터 넣기  →  ② 분석하기  →  ③ 결과 내려받기·보고서 만들기\n```\n\n**① 데이터 올리기**\n- 왼쪽 사이드바 위쪽에서 엑셀(xlsx)·CSV를 올리거나, 이미지·카메라·음성 입력을 선택합니다.\n- 엑셀에 시트가 여러 개면 **시트별로 자동 분리**됩니다.\n- 파일이 없으면 **🧪 샘플 데이터** 버튼으로 먼저 체험해 보세요.\n\n**② 분석하기**\n- 왼쪽 메뉴에서 원하는 분석을 고릅니다.\n- 결과 아래 **➕ 이 결과를 보고서에 담기**를 누릅니다.\n\n**③ 결과 내려받기·보고서 만들기**\n- 각 분석 화면에서 한글(hwpx)·Excel(xlsx) 결과를 바로 내려받거나,\n- 📑 보고서 메뉴에 여러 분석 결과를 모아 한글(hwpx)·워드(docx) 보고서를 만듭니다.\n\n> 💡 **결과는 사라지지 않습니다.** 다른 메뉴에 갔다 와도 분석 결과가 그대로 남아 있습니다.\n\n---\n\n## 2. 메뉴 한눈에 보기\n\n| 메뉴 | 무엇을 하나요 |\n|---|---|\n| 📊 **통계분석** | 데이터 정리 · 분산분석 · 상관 · 회귀 등 |\n| 🧠 **AI 도우미** | 궁금한 걸 물어보고, 어떤 분석을 할지 추천받기 |\n| 💰 **경제성분석** | 소득·순수익 계산, 부분예산표, 증수 효과 |\n| 📋 **설문조사 분석** | 만족도·의견 조사 결과 정리 |\n| 📑 **보고서** | 담아둔 결과를 문서로 만들기 |\n\n---\n\n## 3. 통계분석 메뉴\n\n### 📋 데이터\n- 올린 데이터를 확인하고 **🩺 데이터 검진** 결과를 봅니다.\n- 숫자인데 문자로 읽힌 열(`1,200`, `120kg`)이 있으면 **원클릭 변환** 버튼이 나타납니다.\n- 실험설계(난괴법 등)를 자동으로 추정해 알려줍니다.\n\n### 🧹 전처리\n데이터를 정리합니다. **화면 위에 현재 데이터가 항상 보이므로** 작업 결과를 바로 확인할 수 있습니다.\n\n| 작업 | 언제 쓰나요 |\n|---|---|\n| 결측치 처리 | 조사 누락으로 빈칸이 있을 때 |\n| 이상값 처리 | 입력 실수(15.0 → 150)가 의심될 때 |\n| 중복 행 제거 | 같은 자료가 두 번 들어갔을 때 |\n| 자료형 변환 | 숫자가 문자로 읽혔을 때 |\n| 열 삭제/이름변경 | 필요 없는 열을 뺄 때 |\n| 표준화·정규화 | 단위가 다른 변수를 비교할 때 |\n\n> ↩️ **실행취소** 버튼으로 최대 10단계까지 되돌릴 수 있습니다.\n\n### 🧮 파생변수\n기존 열을 조합해 새 열을 만듭니다.\n- **두 열 사칙연산**: `수량 × 단가 = 조수입`\n- **조건 열**: `기온 ≥ 33` → 폭염일 표시\n- **그룹별 집계**: 연도별 합계·평균\n\n### 🔗 상관분석\n두 변수가 함께 변하는 정도를 봅니다.\n- **Pearson**(직선 관계) / **Spearman**(순위·비정규분포)\n- 논문용 **유의성 별표 표**(`0.826***`)가 자동 생성됩니다.\n\n### 📈 분산분석 — 가장 많이 쓰는 기능\n\n**분석 방식 6가지**\n\n| 방식 | 언제 |\n|---|---|\n| **일원배치** | 처리구 하나 비교 (가장 기본) |\n| **이원배치** | 두 요인 + 상호작용 (품종 × 시비량) |\n| **🌾 분할구법** | 관수·경운처럼 큰 구역 요인이 있을 때 |\n| **🔁 반복측정** | 같은 개체를 시기별로 반복 조사 |\n| **🎚️ ANCOVA** | 초기 생육 차이를 보정하고 싶을 때 |\n| **📊 여러 형질 요약표** | 여러 항목을 한 표로 (논문 표 형식) |\n\n**⚠️ 꼭 확인하세요 — 반복(블록) 열**\n포장시험에서 반복을 두었다면 **반복 열을 반드시 지정**하세요.\n지정하지 않으면 블록 간 토양·경사 차이가 오차에 섞여, 실제로는 있는 처리 효과를 놓칠 수 있습니다.\n\n**사후검정 4가지**\n\n| 방법 | 특징 |\n|---|---|\n| **Tukey HSD** | 국제 표준. 논문 투고에 안전 |\n| **던컨(DMRT)** | 농업 논문 관행. 차이를 잘 잡아냄 |\n| **Bonferroni** | 매우 엄격 |\n| **던넷(Dunnett)** | 대조구와만 비교 (신품종 vs 대비품종) |\n\n**결과 읽기**\n- **유의성 문자**: 같은 문자를 공유하면 차이 없음 (`a`, `ab`, `b`)\n- **CV(%)**: 시험 정밀도. 포장시험 10~20% 양호, 20% 초과 시 재검토\n- **LSD**: 두 평균의 차이가 이 값보다 크면 유의한 차이\n- **논문용 표 각주**가 자동 생성되니 복사해서 쓰세요.\n\n### 🧪 비모수검정\n정규성·등분산 가정이 깨졌을 때 사용합니다.\n(분산분석에서 가정이 위배되면 **자동으로 결과를 함께 보여줍니다.**)\n\n### 🧬 PCA (주성분분석)\n형질이 많을 때 2개 축으로 압축해 그림 하나로 봅니다.\n- 누적 설명분산 **70% 이상**이면 신뢰할 만합니다.\n\n### 📉 회귀분석\n- **단순/다중 회귀**: X로 Y를 설명 (VIF 다중공선성 진단 포함)\n- **로지스틱**: Y가 두 가지 값일 때 (발병/미발병)\n- **🧪 프로빗**: 농약 시험의 **LC50/LD50** 산출\n- **잔차 진단**으로 모형이 적절한지 확인할 수 있습니다.\n\n### 🤖 머신러닝\n수량 예측·등급 판정 등. **🔮 새 데이터 예측** 기능으로 값을 넣으면 바로 예측합니다.\n\n> ⚠️ 표본이 30개 미만이면 쓰지 마세요. 처리 효과 검정은 **분산분석**을 쓰세요.\n\n---\n\n## 4. 🧠 AI 도우미 (선택)\n\nAPI 키를 넣으면 쓸 수 있습니다. **키가 없어도 나머지 기능은 모두 정상 작동합니다.**\n\n**키 넣는 법**: 사이드바 → 🤖 AI 기능 켜기 → 제공사 선택(Claude·Gemini·ChatGPT) → 키 입력\n\n**할 수 있는 것**\n- 결과를 자연어로 질문하기\n- 데이터 자동 요약\n- 연구계획서를 올리면 어떤 분석을 할지 추천\n- 각 분석 결과 아래 **🤖 AI 해석**으로 보고서 문장(`○`·`-` 형식) 생성\n\n> ⚠️ AI가 만든 문장은 **반드시 연구자가 수치와 해석을 확인**한 뒤 사용하세요.\n\n---\n\n## 5. 💰 경제성분석\n\n### 🧭 경제성 분석 길잡이 v3.6 — 처음이면 여기부터\n경제성 분석을 배운 적이 없어도 **STEP 1~5를 한 단계씩** 답하면 적합한 분석방법을 규칙 기반으로 추천합니다. 처음 화면에서는 길잡이와 바로 분석하기 중 하나만 선택하므로 화면이 복잡하지 않습니다. API 키 없이 작동합니다.\n\n1. **STEP 1 연구목적** — 신기술 비교, 현재 수익성, 여러 대안 선택, 시설투자, 손익분기, 위험평가 등\n2. **STEP 2 변화요인** — 품종·방제·재배법, 투입수준, 시설·농기계, 가격·수량 등\n3. **STEP 3 비교구조** — 대조구 vs 신기술, 비용이 다른 여러 대안, 여러 처리의 한 해 성과, 비교대상 없음\n4. **STEP 4 분석기간** — 한 작기·1년, 2년 이상, 시설·기계 내용연수 전체\n5. **STEP 5 보유자료** — 처리구, 수량, 가격, 경영비, 변화비용, 반복, 투자비, 연도별 편익·비용, 할인율 등\n\n모르는 항목은 **잘 모르겠어요**를 골라도 나머지 답으로 판단하며, 답이 너무 불확실하면 임의로 분석을 연결하지 않고 **추천 보류 + 확인할 두 가지**를 안내합니다.\n- 현재 작목의 수익성 → **소득분석**\n- 대조구와 신품종·신기술 비교 → **부분예산법**\n- 비용이 다른 여러 기술 중 추천대안 선택 → **지배분석·MRR**\n- 시설·농기계 장기투자 → **NPV·할인 B/C·IRR**\n- 손익분기 가격·수량 / 가격·수량 변동 위험 → **소득분석 안의 손익분기점·민감도**\n- 정책사업의 사회적 효과(CBA)는 현재 직접 계산하지 않으며 별도 분석이 필요하다고 안내합니다.\n\n추천 결과에는 **추천 확신도, 추천 이유, 필요한 자료, 함께 볼 분석, 자료 준비도**가 표시됩니다. STEP 5 앞의 **📦 자료 준비 가이드**에서는 공통자료, 농촌진흥청 소득조사 체계에 맞춘 비용 항목, 분석별 추가자료와 빈 CSV 서식을 제공합니다. 올린 데이터가 있으면 처리구·수량·단가·비용·반복 열 후보를 자동으로 찾아 STEP 5와 데이터 점검에 활용합니다. **🚀 추천 분석 바로 시작하기**를 누르면 해당 분석 방식이 자동 선택됩니다.\n\n### 💾 기준단가 관리 (먼저 설정)\n노임·자재비·임차료를 한 번 넣어두면 분석에 자동 반영됩니다.\nCSV로 내려받아 보관하고, 다음 해에 갱신해 다시 올릴 수 있습니다.\n\n**기본으로 들어있는 공식 수치** (기준연도 확인 후 사용하세요)\n\n| 항목 | 단가 | 기준연도 | 출처 |\n|---|---|---|---|\n| 농업노임(남) | 153,520원/일 | 2025년 | 통계청 KOSIS 농가판매·구입가격조사 |\n| 농업노임(여) | 121,392원/일 | 2025년 | 통계청 KOSIS |\n| 농업노임(남·시간) | 19,190원/시간 | 2025년 | 일당 ÷ 8시간 |\n| 농업노임(여·시간) | 15,174원/시간 | 2025년 | 일당 ÷ 8시간 |\n| 요소비료(20kg) | 17,900원 | 2026년 | 농협 (보조금 적용 시 16,250원) |\n| 토지용역비(밭) | 260원/㎡ | 2024년 | 농지임차료실태조사 |\n| 토지용역비(논) | 275원/㎡ | 2024년 | 농지임차료실태조사 |\n\n**자동으로 받아올 수 있는 자료**\n- **🌐 KAMIS** : 농산물 가격 (일별) — kamis.or.kr에서 인증키 발급(무료)\n- **📊 KOSIS** : 농촌 일용노임·농가구입가격지수 (분기) — kosis.kr/openapi에서 인증키 발급(무료)\n  - 가장 쉬운 방법: KOSIS 통계표 화면에서 [OpenAPI] 버튼 → 주소 복사 → 앱에 붙여넣기\n\n**직접 확인해 입력해야 하는 자료**\n- 자본용역비 이자율, 감가상각 내용연수 → 농촌진흥청 「농축산물 소득자료집」 부록\n  또는 농산업경영과(063-238-1197) 문의\n- 농협 자재 실판매가(연 1회), 위탁영농비, 지역별 노임\n\n### 📕 부분예산표 (손실적·이익적 요소) — 가장 많이 쓰는 기능\n신기술 도입 시 **바뀐 것만** 모아 늘어난 비용(A)과 늘어난 이익(B)을 비교하고 **추정수익액(B−A)** 을 구합니다. 관행·신기술이 똑같이 쓰는 비용은 넣지 않습니다.\n\n| 자료에서 바뀐 것 | 어디로 |\n|---|---|\n| 수량이 늘었다 (× 단가) | 이익적 요소(B) |\n| 수량이 줄었다 (× 단가) | 손실적 요소(A) |\n| 비용이 늘었다 | 손실적 요소(A) |\n| 비용이 줄었다 | **이익적 요소(B)** — 절감은 번 것입니다 |\n| 노동시간이 늘었다 (× 시간당 노임) | 손실적 요소(A) |\n\n> ⚠️ **자가노동시간처럼 값이 '시간'인 열**은 비용 열이 아니라 **노동시간 열**에 넣으세요. 비용 열에 넣으면 10시간이 10원으로 계산됩니다. 이름에 '시간'이 들어가면 자동으로 골라 줍니다.\n\n**두 가지 방법으로 만들 수 있습니다.**\n1. 화면에서 항목·산출근거·금액을 직접 입력\n2. **📊 올린 데이터에서 자동으로 채우기** — 처리구 열, 수량 열, 대조구, 신기술구, 단가, 비용 열을 고르면 대조구 대비 달라진 값만 뽑아 표를 채워 줍니다(10a 기준 자동 환산). 채운 뒤 손으로 고치거나 항목을 더할 수 있습니다.\n\n> 💡 화면의 **🧮 이 숫자가 어떻게 나온 건가요?** 에 예시 숫자로 따라가는 계산 과정과 자주 하는 실수가 정리되어 있습니다.\n\n### 📗 소득분석\n```\n총수입 = 주산물가액 + 부산물가액\n소득   = 총수입 − 경영비\n순수익 = 총수입 − 생산비\n소득률(%) = 소득 ÷ 총수입 × 100\n```\n**어떤 엑셀을 올리나요** — 화면의 `📋 어떤 엑셀을 올려야 하나요?` 에서 예시 서식을 CSV로 내려받아 숫자만 바꿔 올리면 됩니다.\n- **한 줄 = 한 조사구**(처리구 × 반복)로 적습니다.\n- 모든 값은 **10a(1,000㎡) 기준**으로 환산해 적습니다.\n- 합계·소득같은 **계산 결과 열은 넣지 마세요.** 이중으로 잡힙니다.\n- **작목 유형**(식량작물·노지채소·시설채소·과수 등)을 고르면 그에 맞는 항목을 안내합니다.\n- **과수·다년생**은 과수원 조성비를 내용연수로 나눠 매년 상각합니다.\n- **대조구를 지정하면** 증수율·증수액·순증가소득이 자동 계산됩니다.\n\n### 📘 신기술 경제성 (부분예산·MRR)\nCIMMYT의 부분예산 원칙을 참고해 지배분석과 한계수익률을 계산합니다.\n권장 여부는 사용자가 설정한 최소 MRR과 반복수·가격·수량 민감도를 함께 확인합니다.\n\n---\n\n## 6. 📋 설문조사 분석\n\n**🤖 자동 인식**을 쓰면 문항 유형을 스스로 판별해 한 번에 분석합니다.\n\n| 유형 | 결과 |\n|---|---|\n| 리커트 척도 | 평균·표준편차, 긍정률, **크론바흐 α**, 다이버징 차트 |\n| 객관식 | 빈도·비율 표 + 원형/도넛 그래프 (%·인원 표시) |\n| 다중응답 | 응답률 (합계가 100%를 넘는 것이 정상) |\n| 주관식 | 의견 목록 표, AI 요약 |\n| 교차분석 | 교차표 + 카이제곱 검정 |\n\n**크론바흐 α**: 0.7 이상이면 신뢰할 만합니다.\n\n**🤖 AI 해석**: 객관식·다중응답·리커트·교차분석·자동인식 결과 아래에서 보고서 문장을 만들 수 있습니다.\n설문은 실험과 달라서, 검정하지 않은 결과에 '유의하다'고 쓰지 않도록 AI에게 미리 일러 둡니다.\n\n---\n\n## 7. 📑 보고서\n\n**만드는 순서**\n1. 각 분석에서 **➕ 보고서에 담기**\n2. 📑 보고서 메뉴로 이동\n3. 필요하면 **표지·재료및방법**, **적요**, **표·그림 목차** 추가\n4. 한글(hwpx) 또는 워드(docx)로 내려받기\n\n**자동으로 만들어지는 것**\n- `□` 항목 제목, `◦` 불릿 (시험연구보고서 양식)\n- `<표 1>`, `<그림 1>` 캡션 (왼쪽 정렬)\n- **통계처리 문구** — 어떤 분석·사후검정을 썼는지 자동 서술\n- **적요 초안** — 담긴 결과를 요약\n\n**계획서 첨부**: 연구계획서 파일(hwpx·docx·pdf)을 올리면 내용을 보고서 앞에 넣을 수 있습니다.\n\n---\n\n## 8. 자주 겪는 문제\n\n| 증상 | 해결 |\n|---|---|\n| 한글 파일이 안 열림 | 구버전 한글은 hwpx 미지원 → **워드(docx)로 받으세요** |\n| 워드(docx) 버튼이 비활성화됨 | 현재 배포 서버에서 Word 생성 기능이 꺼진 상태입니다. 관리자에게 문의하세요. |\n| 그래프 글자가 □로 깨짐 | 유의성 문자는 서버 글꼴에 의존하지 않는 수식 위첨자로 표시됩니다. 일반 한글이 깨지면 배포 서버 글꼴을 확인하세요. |\n| 결과가 안 보임 | 분석 실행 버튼을 눌렀는지 확인 |\n| 숫자 열인데 분석이 안 됨 | 데이터 탭에서 **숫자로 변환** 실행 |\n| 반복 열을 안 넣었는데 결과가 이상함 | 분산분석에서 **반복(블록) 열**을 지정하세요 |\n| 빨간 오류 상자가 떴음 | 그 아래 **🆘 이 오류, 도움받기**에서 `🤖 앱 안에서 바로 물어보기` |\n\n---\n\n## 9. 꼭 기억할 것\n\n1. **반복(블록) 열을 지정하세요** — 포장시험 결과가 달라집니다.\n2. **CV(%)를 확인하세요** — 20% 넘으면 시험 정밀도를 점검하세요.\n3. **AI 문장은 반드시 검토하세요** — 그대로 제출하지 마세요.\n4. **분석 결과는 바로 보고서에 담으세요** — 나중에 한 번에 문서가 됩니다.\n5. **기준단가는 기관 공식 자료로 입력하세요** — 자동으로 받아오지 않습니다.\n\n---\n\n*스마트 통계 에이전트*\n"
+    _MANUAL = "# 스마트 통계 에이전트 — 사용설명서\n\n농업연구사·지도사를 위한 실험데이터 통계분석 자동화 도구\n\n---\n\n## 1. 웹에서 시작하기\n\n별도 설치 없이 **스마트 통계 에이전트 웹주소에 접속**해서 사용합니다.\n로그인 기능이 켜져 있으면 회원가입/로그인 후 아래 순서대로 진행하세요.\n\n```\n① 데이터 넣기  →  ② 분석하기  →  ③ 결과 내려받기·보고서 만들기\n```\n\n**① 데이터 올리기**\n- 왼쪽 사이드바 위쪽 **입력 방식**에서 **📁 파일 (Excel·CSV·PDF)**을 고르고 엑셀(xlsx·xls)·CSV·**PDF**를 올리거나, 이미지·카메라·음성 입력을 선택합니다.\n- 올리자마자 **데이터 점검**이 돌아갑니다. 문제가 있으면 화면 위에 요약 상자가 뜨고(📍 엑셀 몇 행인지, 🔧 어떻게 고치는지), 사이드바에도 '❌ 고쳐야 할 문제 ○건 / ⚠️ 데이터 점검 ○건 / ✅ 분석 준비 완료'가 표시됩니다.\n- 엑셀에 시트가 여러 개면 **시트별로 자동 분리**됩니다.\n- **PDF**는 한글·엑셀에서 PDF로 저장한 문서의 **테두리 있는 표**를 그대로 꺼내 표마다 따로 불러옵니다(AI 키 불필요).\n  스캔·사진 PDF나 테두리 없는 표는 **AI 표 인식**(API 키 필요, 앞 3쪽)으로 읽습니다. AI가 읽은 값은 반드시 원본과 대조하세요.\n- 한글 엑셀에서 저장한 CSV(한글 깨짐 형식)도 자동으로 읽습니다.\n- 파일이 없으면 **🧪 샘플 데이터** 버튼으로 먼저 체험해 보세요.\n\n**② 분석하기**\n- 왼쪽 메뉴에서 원하는 분석을 고릅니다.\n- 결과 아래 **➕ 이 결과를 보고서에 담기**를 누릅니다.\n\n**③ 결과 내려받기·보고서 만들기**\n- 각 분석 화면에서 한글(hwpx)·Excel(xlsx) 결과를 바로 내려받거나,\n- 📑 보고서 메뉴에 여러 분석 결과를 모아 한글(hwpx)·워드(docx) 보고서를 만듭니다.\n\n> 💡 **결과는 사라지지 않습니다.** 다른 메뉴에 갔다 와도 분석 결과가 그대로 남아 있습니다.\n\n---\n\n## 2. 메뉴 한눈에 보기\n\n| 메뉴 | 무엇을 하나요 |\n|---|---|\n| ⚡ **원클릭 보고서** | 자료를 올리고 버튼 하나로 설계 판별 → 분석 → 보고서 초안까지 |\n| 📊 **통계분석** | 데이터 정리 · 분산분석 · 상관 · 회귀 등 |\n| 🧠 **AI 도우미** | 궁금한 걸 물어보고, 어떤 분석을 할지 추천받기 |\n| 💰 **경제성분석** | 소득·순수익 계산, 부분예산표, 증수 효과 |\n| 📋 **설문조사 분석** | 만족도·의견 조사 결과 정리 |\n| 📑 **보고서** | 담아둔 결과를 문서로 만들기 |\n\n---\n\n## 3. 통계분석 메뉴\n\n### 📋 데이터\n- 올린 데이터를 확인하고 **🩺 데이터 검진** 결과를 봅니다. 문제마다 ❌(꼭 고칠 것)·⚠️(확인할 것)·ℹ️(참고) 등급, 📍 엑셀 행 번호, 🔧 고치는 법이 나옵니다.\n  - ❌ 표 위 제목 행·병합 머리글로 변수명이 잘못 읽힘, 열이 1개뿐, **평균·합계·소계·표준편차·LSD·CV 같은 요약 행**\n  - ⚠️ 숫자 칸에 글자 섞임(`120kg`, `2349.7a`), 빈칸 위치, 같은 처리명을 다르게 씀(`대조구`/`대조 구`), 중복 행, 처리구·반복을 가로로 펼침, 반복 간 값이 거의 같음(평균 복사 의심), 반복이 1개뿐인 처리, 같은 처리·반복이 두 번 나옴, 처리구 안에서 혼자 크게 튀는 값(소수점 실수 의심)\n  - ℹ️ 처리마다 반복 수가 다름, 음수, 값이 모두 같은 열\n- 요약 행이나 빈 행이 있으면 **🧹 요약 행 빼기** 버튼으로 바로 뺄 수 있습니다(🧹 전처리의 ↩️ 실행취소로 되돌리기 가능). 튀는 값은 알려만 주고 값을 바꾸지 않습니다.\n- ⚡ 원클릭 보고서는 요약 행을 **자동으로 빼고** 분석하며, 몇 행을 뺐는지 결과 아래에 적어 줍니다. 분산분석·비모수검정 화면에도 요약 행이 섞여 있으면 경고가 뜹니다.\n- 숫자인데 문자로 읽힌 열(`1,200`, `120kg`)이 있으면 **원클릭 변환** 버튼이 나타납니다.\n- 실험설계(난괴법 등)를 자동으로 추정해 알려줍니다.\n\n### 🧹 전처리\n데이터를 정리합니다. **화면 위에 현재 데이터가 항상 보이므로** 작업 결과를 바로 확인할 수 있습니다.\n\n| 작업 | 언제 쓰나요 |\n|---|---|\n| 결측치 처리 | 조사 누락으로 빈칸이 있을 때 |\n| 이상값 처리 | 입력 실수(15.0 → 150)가 의심될 때 |\n| 중복 행 제거 | 같은 자료가 두 번 들어갔을 때 |\n| 자료형 변환 | 숫자가 문자로 읽혔을 때 |\n| 열 삭제/이름변경 | 필요 없는 열을 뺄 때 |\n| 표준화·정규화 | 단위가 다른 변수를 비교할 때 |\n\n> ↩️ **실행취소** 버튼으로 최대 10단계까지 되돌릴 수 있습니다.\n\n### 🧮 파생변수\n기존 열을 조합해 새 열을 만듭니다.\n- **두 열 사칙연산**: `수량 × 단가 = 조수입`\n- **조건 열**: `기온 ≥ 33` → 폭염일 표시\n- **그룹별 집계**: 연도별 합계·평균\n\n### 🔗 상관분석\n두 변수가 함께 변하는 정도를 봅니다.\n- **Pearson**(직선 관계) / **Spearman**(순위·비정규분포)\n- 논문용 **유의성 별표 표**(`0.826***`)가 자동 생성됩니다.\n\n### 📈 분산분석 — 가장 많이 쓰는 기능\n\n**분석 방식 6가지**\n\n| 방식 | 언제 |\n|---|---|\n| **일원배치** | 처리구 하나 비교 (가장 기본) |\n| **이원배치** | 두 요인 + 상호작용 (품종 × 시비량) |\n| **🌾 분할구법** | 관수·경운처럼 큰 구역 요인이 있을 때 |\n| **🔁 반복측정** | 같은 개체를 시기별로 반복 조사 |\n| **🎚️ ANCOVA** | 초기 생육 차이를 보정하고 싶을 때 |\n| **📊 여러 형질 요약표** | 여러 항목을 한 표로 (논문 표 형식) |\n\n**⚠️ 꼭 확인하세요 — 반복(블록) 열**\n포장시험에서 반복을 두었다면 **반복 열을 반드시 지정**하세요.\n지정하지 않으면 블록 간 토양·경사 차이가 오차에 섞여, 실제로는 있는 처리 효과를 놓칠 수 있습니다.\n- 반복을 `1, 2, 3`처럼 숫자로 적어도 **반복(블록) 열로 자동 인식**해 측정값 목록에서 빼고 블록으로 골라 둡니다.\n- **일원배치·이원배치·여러 형질 요약표** 모두 반복(블록) 열을 고를 수 있습니다.\n- **반복측정**은 시기가 3개 이상이면 구형성(Greenhouse-Geisser ε)을 점검하고 보정한 p값도 함께 보여 줍니다.\n\n**사후검정 4가지**\n\n| 방법 | 특징 |\n|---|---|\n| **Tukey HSD** | 국제 표준. 논문 투고에 안전 |\n| **던컨(DMRT)** | 농업 논문 관행. 차이를 잘 잡아냄 |\n| **Bonferroni** | 매우 엄격 |\n| **던넷(Dunnett)** | 대조구와만 비교 (신품종 vs 대비품종) |\n\n**결과 읽기**\n- **유의성 문자**: 같은 문자를 공유하면 차이 없음 (`a`, `ab`, `b`)\n- **CV(%)**: 시험 정밀도. 포장시험 10~20% 양호, 20% 초과 시 재검토\n- **LSD**: 두 평균의 차이가 이 값보다 크면 유의한 차이\n- **논문용 표 각주**가 자동 생성되니 복사해서 쓰세요.\n\n**💡 해석 문장 / 📋 보고서용 문장** — 모든 통계분석 결과 아래에 나옵니다(AI 키 불필요).\n- 💡 **쉬운 해석**: 결과가 무슨 뜻인지 한두 줄로 알려 줍니다.\n- 📋 **보고서용 문장**: 시험연구보고서 `○`·`-` 형식 문장입니다. 오른쪽 위 복사 버튼으로 복사하고, **➕ 보고서에 담기**를 누르면 함께 들어갑니다.\n- 유의하지 않은 결과는 '효과가 있다'고 쓰지 않으며, p값이 아주 작으면 `p<0.0001`로 적습니다.\n\n### 🧪 비모수검정\n정규성·등분산 가정이 깨졌을 때 사용합니다.\n(분산분석에서 가정이 위배되면 **자동으로 결과를 함께 보여줍니다.**)\n- 그룹이 3개 이상이고 차이가 유의하면 **Dunn 사후검정(Bonferroni 보정)**으로 어느 그룹끼리 다른지 보여 줍니다.\n\n### 🧬 PCA (주성분분석)\n형질이 많을 때 2개 축으로 압축해 그림 하나로 봅니다.\n- 누적 설명분산 **70% 이상**이면 신뢰할 만합니다.\n\n### 📉 회귀분석\n- **단순/다중 회귀**: X로 Y를 설명합니다.\n  - 위쪽에 **R²·수정 R²·모형 유의성·표본 수**, 아래에 한국어 **회귀계수표**(계수·표준오차·t·p·95% 신뢰구간·**표준화계수 β**·별표)가 나옵니다.\n  - \"생체중이 1g 늘면 수량은 1.75 증가함(p=0.0004)\"처럼 변수별 해석 문장과 회귀식이 자동으로 만들어집니다.\n  - 표본이 적거나 변수끼리 너무 비슷하면(VIF) 주의 문구가 뜹니다. 영어 원문 요약표는 **📄 상세 결과**에 접혀 있습니다.\n- **로지스틱**: Y가 두 가지 값일 때 (발병/미발병). **관심 범주**(예: 발병)를 고르면 변수별 **오즈비(OR)**와 신뢰구간으로 \"1 늘면 발병 가능성이 몇 배\"인지 알려 줍니다.\n- **🧪 프로빗**: 농약 시험의 **LC50/LD50** 산출. 계통이 둘 이상이면 **저항성비**와 신뢰구간 겹침 여부를, 적합도 검정(p<0.05면 주의)도 함께 보여 줍니다.\n- **잔차 진단**으로 모형이 적절한지 확인할 수 있습니다.\n\n### 🤖 머신러닝\n수량 예측·등급 판정 등. **🔮 새 데이터 예측** 기능으로 값을 넣으면 바로 예측합니다.\n\n> ⚠️ 표본이 30개 미만이면 쓰지 마세요. 처리 효과 검정은 **분산분석**을 쓰세요.\n\n---\n\n## 4. 🧠 AI 도우미 (선택)\n\nAPI 키를 넣으면 쓸 수 있습니다. **키가 없어도 나머지 기능은 모두 정상 작동합니다.**\n\n**키 넣는 법**: 사이드바 → 🤖 AI 기능 켜기 → 제공사 선택(Claude·Gemini·ChatGPT) → 키 입력\n\n**할 수 있는 것**\n- 결과를 자연어로 질문하기\n- 데이터 자동 요약\n- 연구계획서를 올리면 어떤 분석을 할지 추천\n- 각 분석 결과 아래 **🤖 AI 해석**으로 보고서 문장(`○`·`-` 형식) 생성\n\n> ⚠️ AI가 만든 문장은 **반드시 연구자가 수치와 해석을 확인**한 뒤 사용하세요.\n\n---\n\n## 5. 💰 경제성분석\n\n### 📥 입력 양식 받기\n화면 위 **📚 경제성 분석에 어떤 자료를 준비해야 하나요?** 를 펼치면 맨 위에 **📥 경제성 분석 입력 양식 받기 (엑셀)** 버튼이 있습니다.\n- 소득분석·부분예산표·신기술(MRR)에 **같이 쓰는 양식 하나**입니다. '입력' 시트에 예시 4행, '작성 안내' 시트에 열마다 단위와 주의사항이 있습니다.\n- 소득분석은 비목을 모두 채우고, 부분예산·MRR은 처리마다 달라지는 비목만 채워도 됩니다.\n- 양식의 비목은 이름이 '~비'로 끝나 **경영비로 자동 선택**되고, 토지임차비·농기계·시설임차비도 비용 분류에 맞게 잡힙니다.\n- **조사면적(a)** 열 값이 모두 같으면 **자료의 기준 면적** 칸이 자동으로 채워집니다(행마다 다르면 경고).\n\n### 🧭 경제성 분석 길잡이 — 처음이면 여기부터\n경제성 분석을 배운 적이 없어도 **STEP 1~5를 한 단계씩** 답하면 적합한 분석방법을 규칙 기반으로 추천합니다. 처음 화면에서는 길잡이와 바로 분석하기 중 하나만 선택하므로 화면이 복잡하지 않습니다. API 키 없이 작동합니다.\n\n1. **STEP 1 연구목적** — 신기술 비교, 현재 수익성, 여러 대안 선택, 시설투자, 손익분기, 위험평가 등\n2. **STEP 2 변화요인** — 품종·방제·재배법, 투입수준, 시설·농기계, 가격·수량 등\n3. **STEP 3 비교구조** — 대조구 vs 신기술, 비용이 다른 여러 대안, 여러 처리의 한 해 성과, 비교대상 없음\n4. **STEP 4 분석기간** — 한 작기·1년, 2년 이상, 시설·기계 내용연수 전체\n5. **STEP 5 보유자료** — 처리구, 수량, 가격, 경영비, 변화비용, 반복, 투자비, 연도별 편익·비용, 할인율 등\n\n모르는 항목은 **잘 모르겠어요**를 골라도 나머지 답으로 판단하며, 답이 너무 불확실하면 임의로 분석을 연결하지 않고 **추천 보류 + 확인할 두 가지**를 안내합니다.\n- 현재 작목의 수익성 → **소득분석**\n- 대조구와 신품종·신기술 비교 → **부분예산법**\n- 비용이 다른 여러 기술 중 추천대안 선택 → **지배분석·MRR**\n- 시설·농기계 장기투자 → **NPV·할인 B/C·IRR**\n- 손익분기 가격·수량 / 가격·수량 변동 위험 → **소득분석 안의 손익분기점·민감도**\n- 정책사업의 사회적 효과(CBA)는 현재 직접 계산하지 않으며 별도 분석이 필요하다고 안내합니다.\n\n추천 결과에는 **추천 확신도, 추천 이유, 필요한 자료, 함께 볼 분석, 자료 준비도**가 표시됩니다. STEP 5 앞의 **📦 자료 준비 가이드**에서는 공통자료, 농촌진흥청 소득조사 체계에 맞춘 비용 항목, 분석별 추가자료를 안내합니다. 올린 데이터가 있으면 처리구·수량·단가·비용·반복 열 후보를 자동으로 찾아 STEP 5와 데이터 점검에 활용합니다. **🚀 추천 분석 바로 시작하기**를 누르면 해당 분석 방식이 자동 선택됩니다.\n\n### 💾 기준단가 관리 (먼저 설정)\n노임·자재비·임차료를 한 번 넣어두면 분석에 자동 반영됩니다.\nCSV로 내려받아 보관하고, 다음 해에 갱신해 다시 올릴 수 있습니다.\n\n**기본으로 들어있는 공식 수치** (자료 시점은 표의 **기준연도** 칸으로 확인하세요)\n\n| 항목 | 단가 | 기준연도 | 출처 |\n|---|---|---|---|\n| 농업노임(남) | 153,520원/일 | 2025년 | 통계청 KOSIS 농가판매·구입가격조사 |\n| 농업노임(여) | 121,392원/일 | 2025년 | 통계청 KOSIS |\n| 농업노임(남·시간) | 19,190원/시간 | 2025년 | 일당 ÷ 8시간 |\n| 농업노임(여·시간) | 15,174원/시간 | 2025년 | 일당 ÷ 8시간 |\n| 요소비료(20kg) | 17,900원 | 2026년 | 농협 (보조금 적용 시 16,250원) |\n| 토지용역비(밭) | 260원/㎡ | 2024년 | 농지임차료실태조사 |\n| 토지용역비(논) | 275원/㎡ | 2024년 | 농지임차료실태조사 |\n\n**자료를 찾을 수 있는 곳** (이 프로그램은 외부 자료를 자동으로 받아오지 않습니다. 확인 후 표에 직접 입력하세요)\n- **농산물 판매가격**: 통계청 농가판매가격조사, 농협·공판장 정산 자료 — 농가가 실제로 받은 가격 권장\n  (도매·소매 가격은 농가수취가격보다 높을 수 있습니다)\n- **농업노임·농가구입가격지수**: 통계청 국가통계포털(KOSIS) '농가판매 및 구입가격조사'\n- **농지 임차료**: 농지공간포털·통계청 농지임차료 조사\n\n**직접 확인해 입력해야 하는 자료**\n- 자본용역비 이자율, 감가상각 내용연수 → 농촌진흥청 「농축산물 소득자료집」 부록\n  또는 농산업경영과(063-238-1197) 문의\n- 농협 자재 실판매가(연 1회), 위탁영농비, 지역별 노임\n\n### 📕 부분예산표 (손실적·이익적 요소) — 가장 많이 쓰는 기능\n신기술 도입 시 **바뀐 것만** 모아 늘어난 비용(A)과 늘어난 이익(B)을 비교하고 **추정수익액(B−A)** 을 구합니다. 관행·신기술이 똑같이 쓰는 비용은 넣지 않습니다.\n\n| 자료에서 바뀐 것 | 어디로 |\n|---|---|\n| 수량이 늘었다 (× 단가) | 이익적 요소(B) |\n| 수량이 줄었다 (× 단가) | 손실적 요소(A) |\n| 비용이 늘었다 | 손실적 요소(A) |\n| 비용이 줄었다 | **이익적 요소(B)** — 절감은 번 것입니다 |\n| 노동시간이 늘었다 (× 시간당 노임) | 손실적 요소(A) |\n\n> ⚠️ **자가노동시간처럼 값이 '시간'인 열**은 비용 열이 아니라 **노동시간 열**에 넣으세요. 비용 열에 넣으면 10시간이 10원으로 계산됩니다. 이름에 '시간'이 들어가면 자동으로 골라 줍니다.\n\n**두 가지 방법으로 만들 수 있습니다.**\n1. 화면에서 항목·산출근거·금액을 직접 입력\n2. **📊 올린 데이터에서 자동으로 채우기** — 처리구 열, 수량 열, 대조구, 신기술구, 단가, 비용 열을 고르면 대조구 대비 달라진 값만 뽑아 표를 채워 줍니다(10a 기준 자동 환산). 채운 뒤 손으로 고치거나 항목을 더할 수 있습니다.\n   - **비용 열은 애매하면 모두 넣어도 됩니다.** 비용으로 보이는 열이 처음부터 모두 골라져 있고, 대조구와 값이 같은 비용은 자동으로 빠집니다. 단 합계·경영비·소득 같은 계산 결과 열은 이중 계산이라 막습니다.\n   - **단가를 넣어야 판매수익 증가가 계산됩니다.** 단가가 0이면 경고가 뜹니다.\n\n> 💡 화면의 **🧮 이 숫자가 어떻게 나온 건가요?** 에 예시 숫자로 따라가는 계산 과정과 자주 하는 실수가 정리되어 있습니다.\n\n### 📗 소득분석\n```\n총수입 = 주산물가액 + 부산물가액\n소득   = 총수입 − 경영비\n순수익 = 총수입 − 생산비\n소득률(%) = 소득 ÷ 총수입 × 100\n```\n**어떤 엑셀을 올리나요** — 위 **📥 입력 양식**을 내려받아 숫자만 바꿔 올리면 됩니다.\n- **한 줄 = 한 조사구**(처리구 × 반복)로 적습니다.\n- 조사구 면적 기준 그대로 적고 **조사면적(a)** 열(또는 **자료의 기준 면적** 칸)에 면적을 넣으면 10a로 환산합니다.\n- 단위 확인란에 체크해야 실행 버튼이 켜집니다(체크 전에는 안내 문구만 보입니다).\n- 합계·소득같은 **계산 결과 열은 넣지 마세요.** 이중으로 잡힙니다.\n- **작목 유형**(식량작물·노지채소·시설채소·과수 등)을 고르면 그에 맞는 항목을 안내합니다.\n- **과수·다년생**은 과수원 조성비를 내용연수로 나눠 매년 상각합니다.\n- **대조구를 지정하면** 증수율·증수액·순증가소득이 자동 계산됩니다.\n\n### 📘 신기술 경제성 (부분예산·MRR)\nCIMMYT의 부분예산 원칙을 참고해 지배분석과 한계수익률을 계산합니다.\n권장 여부는 사용자가 설정한 최소 MRR과 반복수·가격·수량 민감도를 함께 확인합니다.\n\n---\n\n## 6. 📋 설문조사 분석\n\n**🤖 자동 인식**을 쓰면 문항 유형을 스스로 판별해 한 번에 분석합니다.\n\n| 유형 | 결과 |\n|---|---|\n| 리커트 척도 | 평균·표준편차, 긍정률, **크론바흐 α**, 다이버징 차트 |\n| 객관식 | 빈도·비율 표 + 원형/도넛 그래프 (%·인원 표시) |\n| 다중응답 | 응답률 (합계가 100%를 넘는 것이 정상) |\n| 주관식 | 의견 목록 표, 자주 나온 낱말, AI 요약 |\n| 교차분석 | 교차표 + 카이제곱 검정 (엑셀에는 편집 가능한 **누적 막대 그래프**와 비율표 시트) |\n\n**💡 해석 문장 / 📋 보고서용 문장**: 유형마다 자동으로 만들어집니다(AI 키 불필요).\n리커트는 전체 평균·긍정률·가장 높은/낮은 문항·신뢰도를, 객관식은 문항별 최다 응답과 쏠림 정도를, 교차분석은 카이제곱 결과와 집단별 최다 응답을 정리합니다.\n빈도·평균만 본 결과에는 '유의하다'고 쓰지 않고, 응답자가 30명 미만이면 주의 문구를 붙입니다.\n\n**크론바흐 α**: 0.7 이상이면 신뢰할 만합니다.\n\n**🤖 AI 해석**: 객관식·다중응답·리커트·교차분석·자동인식 결과 아래에서 보고서 문장을 만들 수 있습니다.\n설문은 실험과 달라서, 검정하지 않은 결과에 '유의하다'고 쓰지 않도록 AI에게 미리 일러 둡니다.\n\n---\n\n## 7. 📑 보고서\n\n**만드는 순서**\n1. 각 분석에서 **➕ 보고서에 담기**\n2. 📑 보고서 메뉴로 이동\n3. 필요하면 **표지·재료및방법**, **적요**, **표·그림 목차** 추가\n4. 한글(hwpx) 또는 워드(docx)로 내려받기\n\n**자동으로 만들어지는 것**\n- `□` 항목 제목, `◦` 불릿 (시험연구보고서 양식)\n- `<표 1>`, `<그림 1>` 캡션 (왼쪽 정렬)\n- **통계처리 문구** — 어떤 분석·사후검정을 썼는지 자동 서술. 화면에서는 문장마다 줄을 바꿔 보여 주고, 한글·워드 보고서에는 한 문단으로 들어갑니다.\n- **엑셀(xlsx)** — 화면에 그래프가 있는 결과는 엑셀에도 편집 가능한 그래프가 들어갑니다(숫자를 고치면 그래프가 따라 바뀜).\n- **적요 초안** — 담긴 결과를 요약\n\n**계획서 첨부**: 연구계획서 파일(hwpx·docx·pdf)을 올리면 내용을 보고서 앞에 넣을 수 있습니다.\n\n---\n\n## 8. 자주 겪는 문제\n\n| 증상 | 해결 |\n|---|---|\n| 한글 파일이 안 열림 | 구버전 한글은 hwpx 미지원 → **워드(docx)로 받으세요** |\n| 워드(docx) 버튼이 비활성화됨 | 현재 배포 서버에서 Word 생성 기능이 꺼진 상태입니다. 관리자에게 문의하세요. |\n| 그래프 글자가 □로 깨짐 | 유의성 문자는 서버 글꼴에 의존하지 않는 수식 위첨자로 표시됩니다. 일반 한글이 깨지면 배포 서버 글꼴을 확인하세요. |\n| 결과가 안 보임 | 분석 실행 버튼을 눌렀는지 확인 |\n| 숫자 열인데 분석이 안 됨 | 데이터 탭에서 **숫자로 변환** 실행 |\n| CSV 한글이 깨짐 | 자동으로 한글 형식(cp949)까지 읽습니다. 그래도 깨지면 엑셀에서 'CSV UTF-8'로 다시 저장하세요 |\n| PDF 표를 못 찾음 | 테두리 없는 표일 수 있습니다. 엑셀·CSV로 올리거나 AI 키를 넣고 다시 올리세요 |\n| PDF를 올리면 'PDF 읽기 부품이 설치되지 않아…'가 뜸 | 배포 서버에 pdfplumber가 없습니다. 관리자가 requirements.txt에 `pdfplumber`를 넣고 앱을 다시 시작(Reboot)하면 됩니다 |\n| 평균·합계 행이 섞인 엑셀 | 📋 데이터의 **🧹 요약 행 빼기**를 누르세요. 원클릭 보고서는 자동으로 뺍니다 |\n| 반복 열을 안 넣었는데 결과가 이상함 | 분산분석에서 **반복(블록) 열**을 지정하세요 |\n| 빨간 오류 상자가 떴음 | 그 아래 **🆘 이 오류, 도움받기**에서 `🤖 앱 안에서 바로 물어보기` |\n\n---\n\n## 9. 꼭 기억할 것\n\n1. **반복(블록) 열을 지정하세요** — 포장시험 결과가 달라집니다.\n2. **CV(%)를 확인하세요** — 20% 넘으면 시험 정밀도를 점검하세요.\n3. **AI 문장은 반드시 검토하세요** — 그대로 제출하지 마세요.\n4. **분석 결과는 바로 보고서에 담으세요** — 나중에 한 번에 문서가 됩니다.\n5. **기준단가는 기관 공식 자료로 입력하세요** — 자동으로 받아오지 않습니다. 기준연도 칸을 꼭 확인하세요.\n\n---\n\n*스마트 통계 에이전트*\n"
     def _manual_html(md_text):
         """설명서를 어느 컴퓨터에서나 열리는 HTML로 변환"""
         try:
@@ -11640,8 +12882,9 @@ else:
         stat_text = build_stat_method_text(
             logs, {"design": None if m_design.startswith("(") else m_design,
                    "cv": auto_cv.strip() or None})
-        st.code(stat_text, language=None)
-        st.caption("분석 이력을 바탕으로 자동 작성되었습니다. 필요하면 복사해 수정하세요.")
+        st.code(sentence_lines(stat_text), language=None, wrap_lines=True)
+        st.caption("분석 이력을 바탕으로 자동 작성되었습니다. 필요하면 복사해 수정하세요. "
+                   "보고서에 넣을 때는 한 문단으로 들어갑니다.")
 
         if st.button("➕ 표지·재료및방법을 보고서 맨 앞에 넣기", width="stretch"):
             new_items = []
@@ -11709,7 +12952,7 @@ else:
                                 "정리해 주세요. 없는 내용은 지어내지 마세요.\n\n" + ptext,
                                 st.session_state.get("api_key"),
                                 st.session_state.get("ai_model_g"),
-                                max_tokens=1500)
+                                max_tokens=2000)
                     st.session_state.report_items.insert(
                         0, {"heading": sec_title, "text": content, "table": None, "image": None})
                     st.success("보고서 맨 앞에 넣었습니다!")
@@ -11748,7 +12991,7 @@ else:
                         "'~하였다', '~로 나타났다')로 자연스럽게 다듬어 주세요. "
                         "새로운 사실을 추가하지 말고, 있는 내용만 정리하세요.\n\n" + draft,
                         st.session_state.get("api_key"), st.session_state.get("ai_model_g"),
-                        max_tokens=900)
+                        max_tokens=1500)
                     st.markdown(polished)
                     ai_disclaimer()
         else:

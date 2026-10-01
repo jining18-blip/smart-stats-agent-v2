@@ -176,7 +176,7 @@ def validate_economic_inputs(
     area = _finite_nonnegative_scalar(source_area_a, "자료 기준 면적", errors)
     if area == 0:
         errors.append("자료 기준 면적은 0보다 커야 합니다.")
-    _finite_nonnegative_scalar(wage_per_hour, "농촌임료금", errors)
+    _finite_nonnegative_scalar(wage_per_hour, "농업노임(시간당)", errors)
     _finite_nonnegative_scalar(interest_rate, "자본 이자율", errors, maximum=100)
     _finite_nonnegative_scalar(capital_months, "자본 적용기간", errors, maximum=12)
     _finite_nonnegative_scalar(fixed_asset_per_10a, "고정자산 부분현재가/평가액", errors)
@@ -261,7 +261,7 @@ def calculate_row_economics(
         depreciation_cost_cols=depreciation_cost_cols,
     )
     # calculate_row_economics는 임차료 중복 여부를 UI에서 land_type과 함께 검사한다.
-    errors = [e for e in errors if not e.startswith("경영비의 임차료와 별도 토지용역비")]
+    errors = [e for e in errors if not e.startswith("경영비의 토지 임차료 열과 별도 토지 임차료")]
     if errors:
         raise ValueError(" / ".join(errors))
 
