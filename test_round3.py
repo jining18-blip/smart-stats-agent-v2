@@ -209,3 +209,19 @@ def test_manual_mentions_new_features():
     for lab in ("📁 파일 (Excel·CSV·PDF)", "🧹 요약 행 빼기", "분석 준비 완료"):
         assert lab in manual and lab in code, lab
     assert "pdfplumber" in manual
+
+
+# ---------------------------------------------------------------- 문의처
+def test_contact_shown_everywhere():
+    assert 'CONTACT_NAME = "경상북도농업기술원 영양고추연구소 이효진"' in SRC
+    assert 'CONTACT_EMAIL = "hyo99@korea.kr"' in SRC
+    i = SRC.index('    _MANUAL = "')
+    manual = ast.literal_eval(SRC[i:SRC.index("\n", i)].split("=", 1)[1].strip())
+    assert "## 10. 문의" in manual and "hyo99@korea.kr" in manual
+    assert "가입·로그인 문의: {CONTACT_NAME}" in SRC                  # 로그인 화면
+    assert "캡처해 **{CONTACT_EMAIL}**" in SRC                          # 오류 도움받기 상자
+    at = AppTest.from_file(str(APP), default_timeout=240)
+    at.run()
+    assert not at.exception
+    cap = " ".join(c.value for c in at.sidebar.caption)
+    assert "문의" in cap and "경상북도농업기술원 영양고추연구소" in cap and "hyo99@korea.kr" in cap
