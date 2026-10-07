@@ -2226,6 +2226,44 @@ _FB_TOKEN_URL = "https://securetoken.googleapis.com/v1/token"
 _FS_BASE_URL = "https://firestore.googleapis.com/v1"
 _AUTH_SESSION_KEYS = ("auth_user", "auth_id_token", "auth_refresh_token", "auth_expires_at")
 _NO_ORG_LABEL = "개인 (소속 없음)"
+# 기관 유형별 소속기관 목록 — 직접 입력하면 '경북농기원/경상북도 농업기술원'처럼 같은 기관이
+# 따로 집계되므로, 목록이 있는 유형은 고르게 하고 없을 때만 직접 입력한다.
+_ORG_DIRECT = "✏️ 목록에 없음 (직접 입력)"
+_ORG_CHOICES = {
+    "도·특광역시 농업기술원": [
+        "경기도농업기술원", "강원특별자치도농업기술원", "충청북도농업기술원", "충청남도농업기술원",
+        "전북특별자치도농업기술원", "전라남도농업기술원", "경상북도농업기술원", "경상남도농업기술원",
+        "제주특별자치도농업기술원",
+        "서울특별시농업기술센터", "부산광역시농업기술센터", "대구광역시농업기술센터",
+        "인천광역시농업기술센터", "광주광역시농업기술센터", "대전광역시농업기술센터",
+        "울산광역시농업기술센터", "세종특별자치시농업기술센터"],
+    "농촌진흥청/소속기관": [
+        "농촌진흥청", "국립농업과학원", "국립식량과학원", "국립원예특작과학원", "국립축산과학원"],
+}
+# 예전에 직접 입력된 이름을 관리자 통계에서 같은 기관으로 묶는다(가입 정보 자체는 바꾸지 않는다).
+_ORG_ALIASES = {
+    "경기": "경기도농업기술원", "강원": "강원특별자치도농업기술원", "충북": "충청북도농업기술원",
+    "충청북도": "충청북도농업기술원", "충남": "충청남도농업기술원", "충청남도": "충청남도농업기술원",
+    "전북": "전북특별자치도농업기술원", "전라북도": "전북특별자치도농업기술원",
+    "전북특별자치도": "전북특별자치도농업기술원", "전남": "전라남도농업기술원",
+    "전라남도": "전라남도농업기술원", "경북": "경상북도농업기술원", "경상북도": "경상북도농업기술원",
+    "경남": "경상남도농업기술원", "경상남도": "경상남도농업기술원", "제주": "제주특별자치도농업기술원",
+    "제주특별자치도": "제주특별자치도농업기술원", "경기도": "경기도농업기술원",
+    "강원도": "강원특별자치도농업기술원", "강원특별자치도": "강원특별자치도농업기술원",
+}
+
+
+def _org_canonical(name):
+    """'경북 농기원', '경상북도 농업기술원' → '경상북도농업기술원' (도 농업기술원 본원 이름만 묶는다)."""
+    raw = str(name or "").strip()
+    key = re.sub(r"\s+", "", raw)
+    m = re.fullmatch(r"(.+?)(?:도)?(?:농업기술원|농기원|농업기술연구원)(?:본원)?", key)
+    if m:
+        head = m.group(1)
+        for cand in (head, head + "도"):
+            if cand in _ORG_ALIASES:
+                return _ORG_ALIASES[cand]
+    return raw
 _NO_ORG_VALUE = "개인"
 
 
@@ -2860,6 +2898,240 @@ def _finish_login(js):
     return False
 
 
+# ---------------------------------------------------------------- Google 로그인 (2026-10-07 추가)
+# korea.kr 메일은 Firebase 인증 메일이 막히므로, Google 계정으로 바로 로그인하는 길을 함께 둔다.
+# 흐름: Google 로그인 화면 → 앱 주소로 돌아옴(?code=…) → code를 Google ID 토큰으로 교환 →
+#       Firebase signInWithIdp → 기존 이메일 로그인과 같은 세션 형태로 저장.
+# Google이 이메일 확인을 이미 끝냈으므로 인증 메일을 보내지 않는다.
+# 필요한 secrets: GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, APP_URL
+#   (셋 중 하나라도 없으면 Google 버튼이 나타나지 않고 기존 로그인만 보인다)
+_GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_GOOGLE_RETURN_PARAMS = ("code", "state", "scope", "authuser", "prompt", "hd", "error", "iss")
+_GOOGLE_STATE_MAX_AGE = 900          # 로그인 화면을 연 뒤 15분 안에 돌아와야 한다
+_KOREA_KR_NOTICE = ("korea.kr 메일은 인증 메일이 오지 않을 수 있어요. "
+                    "다른 메일 주소를 쓰거나 위의 Google 로그인을 이용해 주세요.")
+_ORG_TYPES = ["도·특광역시 농업기술원", "농촌진흥청/소속기관", "시·군 농업기술센터",
+              "대학교/연구기관", "농업 관련 기업/단체", "기타", _NO_ORG_LABEL]
+
+
+def _google_config():
+    cid = _secret("GOOGLE_OAUTH_CLIENT_ID").strip()
+    sec = _secret("GOOGLE_OAUTH_CLIENT_SECRET").strip()
+    url = _secret("APP_URL").strip()
+    if url and not url.endswith("/"):
+        url += "/"
+    return {"client_id": cid, "client_secret": sec, "redirect_uri": url,
+            "enabled": bool(cid and sec and url)}
+
+
+def _is_korea_kr(email):
+    host = str(email or "").strip().lower().rsplit("@", 1)[-1]
+    return "@" in str(email or "") and (host == "korea.kr" or host.endswith(".korea.kr"))
+
+
+def _google_state_make(remember):
+    """돌아올 때 위조 여부를 확인할 서명된 state. 새 창에서 돌아오므로 세션 대신 서명을 쓴다."""
+    import hmac, hashlib, time, secrets as _sec
+    g = _google_config()
+    body = f"{int(time.time())}.{1 if remember else 0}.{_sec.token_hex(8)}"
+    sig = hmac.new(g["client_secret"].encode(), body.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{body}.{sig}"
+
+
+def _google_state_check(state):
+    """서명과 유효 시간을 확인한다. (통과 여부, 로그인 상태 유지 여부) 반환."""
+    import hmac, hashlib, time
+    try:
+        ts, rem, nonce, sig = str(state or "").split(".")
+        g = _google_config()
+        good = hmac.new(g["client_secret"].encode(), f"{ts}.{rem}.{nonce}".encode(),
+                        hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(sig, good):
+            return False, False
+        if not (0 <= time.time() - int(ts) <= _GOOGLE_STATE_MAX_AGE):
+            return False, False
+        return True, rem == "1"
+    except Exception:
+        return False, False
+
+
+def _google_login_url(remember):
+    from urllib.parse import urlencode
+    g = _google_config()
+    return _GOOGLE_AUTH_URL + "?" + urlencode({
+        "client_id": g["client_id"], "redirect_uri": g["redirect_uri"],
+        "response_type": "code", "scope": "openid email profile",
+        "state": _google_state_make(remember), "prompt": "select_account"})
+
+
+def _google_exchange_code(code):
+    """Google 인가 코드를 ID 토큰으로 바꾼다. (id_token, 오류) 반환."""
+    g = _google_config()
+    try:
+        r = _requests.post(_GOOGLE_TOKEN_URL, data={
+            "code": code, "client_id": g["client_id"], "client_secret": g["client_secret"],
+            "redirect_uri": g["redirect_uri"], "grant_type": "authorization_code"}, timeout=20)
+    except Exception as ex:
+        return None, f"NETWORK:{type(ex).__name__}"
+    try:
+        js = r.json() or {}
+    except Exception:
+        js = {}
+    if r.status_code != 200 or not js.get("id_token"):
+        return None, str(js.get("error") or f"HTTP_{r.status_code}")
+    return js["id_token"], None
+
+
+def _fb_signin_google(google_id_token):
+    g = _google_config()
+    return _fb_post("signInWithIdp", {
+        "postBody": f"id_token={google_id_token}&providerId=google.com",
+        "requestUri": g["redirect_uri"], "returnIdpCredential": True, "returnSecureToken": True})
+
+
+def _google_clear_params():
+    for k in _GOOGLE_RETURN_PARAMS:
+        try:
+            if k in st.query_params:
+                del st.query_params[k]
+        except Exception:
+            pass
+
+
+def _google_handle_return(cfg):
+    """Google 로그인에서 돌아왔으면(?code=…) 로그인을 마친다. 오류 문구는 세션에 남겨 화면에 보여 준다."""
+    if not _google_config()["enabled"]:
+        return False
+    try:
+        code = st.query_params.get("code")
+        state = st.query_params.get("state")
+        gerr = st.query_params.get("error")
+    except Exception:
+        return False
+    if not code and not gerr:
+        return False
+    _google_clear_params()                 # 코드는 한 번만 쓸 수 있으므로 먼저 지운다
+    if gerr:                               # 사용자가 Google 창에서 취소한 경우
+        st.session_state["auth_google_msg"] = "Google 로그인이 취소되었습니다."
+        return False
+    if st.session_state.get("_auth_google_used") == code:
+        return False
+    st.session_state["_auth_google_used"] = code
+    ok, remember = _google_state_check(state)
+    if not ok:
+        st.session_state["auth_google_msg"] = "로그인 시간이 지났습니다. Google 로그인 버튼을 다시 눌러 주세요."
+        return False
+    gid, err = _google_exchange_code(code)
+    if err:
+        st.session_state["auth_google_msg"] = ("Google 로그인을 마치지 못했습니다. 다시 시도해 주세요. "
+                                               f"(오류: {err})")
+        return False
+    js, err = _fb_signin_google(gid)
+    if err:
+        code_ = _fb_error_code(err)
+        st.session_state["auth_google_msg"] = (
+            "Firebase 콘솔에서 Google 로그인이 켜져 있지 않습니다. 관리자에게 문의해 주세요."
+            if code_ == "OPERATION_NOT_ALLOWED" else _fb_error_text(err))
+        return False
+    email = str(js.get("email", ""))
+    if js.get("needConfirmation"):         # 같은 주소로 이메일/비밀번호 가입이 이미 있음
+        st.session_state["auth_google_msg"] = (
+            f"{email} 은 이미 이메일·비밀번호로 가입되어 있어요. 아래 로그인 탭에서 로그인해 주세요.")
+        return False
+    if not _email_allowed(email, cfg):
+        st.session_state["auth_google_msg"] = "이용이 허용되지 않은 이메일입니다. 관리자에게 문의해 주세요."
+        return False
+    js = {**js, "email": email}
+    meta = _load_profile(js.get("localId"), email)
+    if not meta.get("organization") and _fs_session() is not None:
+        # 처음 들어온 사람: 소속을 한 번 받은 뒤 로그인시킨다.
+        st.session_state["auth_google_pending"] = {
+            "js": js, "remember": remember, "name": js.get("displayName") or meta.get("name", "")}
+        return False
+    return _google_complete(js, meta, remember)
+
+
+def _google_complete(js, meta, remember):
+    if not _save_auth_session(js, meta):
+        st.session_state["auth_google_msg"] = "로그인 응답을 확인하지 못했습니다."
+        return False
+    st.session_state.pop("auth_google_pending", None)
+    st.session_state.pop("auth_unverified", None)
+    _record_login(st.session_state.get("auth_user"))
+    if remember and _HAS_JS_EVAL:
+        st.session_state.pop("_auth_remember_clear", None)
+        _remember_bump()
+        st.session_state["_auth_remember_rt"] = st.session_state.get("auth_refresh_token", "")
+    return True
+
+
+def _korea_kr_notice():
+    if _google_config()["enabled"]:
+        return _KOREA_KR_NOTICE
+    return "korea.kr 메일은 인증 메일이 오지 않을 수 있어요. 다른 메일 주소를 이용해 주세요."
+
+
+def _render_google_first_visit():
+    """Google로 처음 들어온 사람에게 소속을 한 번 묻는다. 화면을 그렸으면 True."""
+    pend = st.session_state.get("auth_google_pending")
+    if not pend:
+        return False
+    js = pend["js"]
+    st.markdown("#### 처음 오셨네요! 소속을 알려 주세요")
+    st.caption(f"{js.get('email', '')} 로 로그인했습니다. 이용 현황 파악에만 쓰이며, 처음 한 번만 묻습니다.")
+    nm = st.text_input("이름", value=pend.get("name", ""), key="auth_g_name")
+    org_type = st.selectbox("기관 유형", _ORG_TYPES, key="auth_g_org_type")
+    if org_type == _NO_ORG_LABEL:
+        org, dept = _NO_ORG_VALUE, ""
+        st.caption("소속기관 없이 개인으로 이용합니다.")
+    else:
+        # 회원가입 화면과 같은 방식: 목록이 있는 유형은 고르고, 없을 때만 직접 입력한다.
+        _direct = globals().get("_ORG_DIRECT", "✏️ 목록에 없음 (직접 입력)")
+        _choices = (globals().get("_ORG_CHOICES") or {}).get(org_type)
+        if _choices:
+            _pick = st.selectbox("소속기관", _choices + [_direct], index=None,
+                                 placeholder="소속기관을 고르세요", key="auth_g_org_pick")
+            if _pick == _direct:
+                org = st.text_input("소속기관 이름", placeholder="예: OO도농업기술원", key="auth_g_org")
+            else:
+                org = _pick or ""
+        else:
+            _ph = "예: 한국농수산대학교" if globals().get("_ORG_CHOICES") else "예: 경상북도농업기술원"
+            org = st.text_input("소속기관", placeholder=_ph, key="auth_g_org")
+        dept = st.text_input("부서/연구소 (선택)", placeholder="예: 영양고추연구소", key="auth_g_dept")
+    consent = st.checkbox("이름·이메일·소속기관 및 서비스 접속기록을 운영 목적으로 저장하는 것에 동의합니다.",
+                          key="auth_g_consent")
+    if st.button("시작하기", type="primary", width="stretch", key="auth_g_start"):
+        if not nm or not org or not consent:
+            st.warning("이름·소속기관과 개인정보 안내 동의를 확인해 주세요.")
+        else:
+            meta = {"name": nm.strip(), "organization_type": org_type,
+                    "organization": org.strip(), "department": dept.strip()}
+            _fs_set("profiles", js.get("localId"), {**meta, "email": str(js.get("email", "")).lower(),
+                                                    "created_at": _now_utc(), "consent_at": _now_utc()})
+            if _google_complete(js, meta, pend.get("remember")):
+                st.rerun()
+    if st.button("취소", width="stretch", key="auth_g_cancel"):
+        st.session_state.pop("auth_google_pending", None)
+        st.rerun()
+    return True
+
+
+def _render_google_button():
+    """로그인 탭들 위에 'Google로 로그인' 버튼을 그린다. 설정이 없으면 아무것도 그리지 않는다."""
+    if not _google_config()["enabled"]:
+        return
+    msg = st.session_state.pop("auth_google_msg", None)
+    if msg:
+        st.error(msg)
+    remember = bool(st.session_state.get("auth_remember")) if _HAS_JS_EVAL else False
+    st.link_button("Google로 로그인", _google_login_url(remember), type="primary", width="stretch")
+    st.caption("새 창에서 Google 계정을 고르면 바로 들어갑니다. 인증 메일이 필요 없어요.")
+    st.markdown("<div style='text-align:center;color:#888;font-size:0.85rem;margin:6px 0 2px'>"
+                "또는 이메일로</div>", unsafe_allow_html=True)
+
+
 def render_auth_gate():
     """AUTH_REQUIRED=true이고 Firebase가 설정된 경우 회원만 앱에 진입하게 한다."""
     cfg = _auth_config()
@@ -2867,6 +3139,8 @@ def render_auth_gate():
     if not (cfg["api_key"] and cfg["required"]):
         return True
     user = _current_auth_user()
+    if not user and _google_handle_return(cfg):
+        user = _current_auth_user()
     if not user and _try_remembered_login(cfg):
         user = _current_auth_user()
     _remember_sync()
@@ -2880,6 +3154,9 @@ def render_auth_gate():
     with c2:
         st.markdown("## 📊 스마트 통계 에이전트")
         st.caption("회원가입 후 연구 데이터를 쉽고 정확하게 분석하세요.")
+        if _render_google_first_visit():
+            st.stop()
+        _render_google_button()
         login_tab, signup_tab, reset_tab = st.tabs(["🔐 로그인", "✨ 회원가입", "🔑 비밀번호 찾기"])
         with login_tab:
             em = st.text_input("이메일", key="auth_login_email", autocomplete="username")
@@ -2919,6 +3196,8 @@ def render_auth_gate():
         with signup_tab:
             nm = st.text_input("이름", key="auth_name")
             em2 = st.text_input("이메일", key="auth_signup_email", autocomplete="username")
+            if _is_korea_kr(em2):
+                st.warning(_korea_kr_notice())
             if _allowed_hint(cfg):
                 st.caption(f"기관 메일({_allowed_hint(cfg)})로 가입할 수 있습니다. "
                            "다른 메일은 관리자가 등록해야 합니다.")
@@ -2933,7 +3212,16 @@ def render_auth_gate():
                 org, dept = _NO_ORG_VALUE, ""
                 st.caption("소속기관 없이 개인으로 가입합니다.")
             else:
-                org = st.text_input("소속기관", placeholder="예: 경상북도농업기술원", key="auth_org")
+                _choices = _ORG_CHOICES.get(org_type)
+                if _choices:
+                    _pick = st.selectbox("소속기관", _choices + [_ORG_DIRECT], index=None,
+                                         placeholder="소속기관을 고르세요", key="auth_org_pick")
+                    if _pick == _ORG_DIRECT:
+                        org = st.text_input("소속기관 이름", placeholder="예: OO도농업기술원", key="auth_org")
+                    else:
+                        org = _pick or ""
+                else:
+                    org = st.text_input("소속기관", placeholder="예: 한국농수산대학교", key="auth_org")
                 dept = st.text_input("부서/연구소 (선택)", placeholder="예: 영양고추연구소", key="auth_dept")
             consent = st.checkbox("이름·이메일·소속기관 및 서비스 접속기록을 운영 목적으로 저장하는 것에 동의합니다.",
                                   key="auth_consent")
@@ -2974,6 +3262,8 @@ def render_auth_gate():
 
         with reset_tab:
             rem = st.text_input("가입한 이메일", key="auth_reset_email", autocomplete="username")
+            if _is_korea_kr(rem):
+                st.warning(_korea_kr_notice())
             if st.button("비밀번호 재설정 메일 보내기", width="stretch", key="auth_reset_btn"):
                 if not rem:
                     st.warning("이메일을 입력해 주세요.")
@@ -3026,12 +3316,12 @@ def render_admin_dashboard():
             df_[col] = _to_kst_text(df_[col])
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("가입 사용자", f"{len(p):,}명")
-    c2.metric("확인된 소속기관", f"{p['organization'].replace('', np.nan).nunique() if 'organization' in p else 0:,}곳")
+    c2.metric("확인된 소속기관", f"{p['organization'].fillna('').map(_org_canonical).replace('', np.nan).nunique() if 'organization' in p else 0:,}곳")
     c3.metric("로그인 기록", f"{len(ev):,}회")
     c4.metric("기능 이용 기록", f"{len(uv):,}회")
     if not p.empty and "organization" in p:
         st.markdown("### 🏢 기관별 사용자")
-        g = (p.assign(소속기관=p["organization"].fillna("미입력").replace("", "미입력"))
+        g = (p.assign(소속기관=p["organization"].fillna("").map(_org_canonical).replace("", "미입력"))
                .groupby("소속기관", dropna=False).size().reset_index(name="사용자 수")
                .sort_values("사용자 수", ascending=False))
         smart_table(g, width="stretch", hide_index=True)
@@ -3049,7 +3339,7 @@ def render_admin_dashboard():
         st.caption(f"기능 이용 기록을 불러오지 못했습니다: {e3}")
     if not uv.empty:
         st.markdown("### 📈 기관별 기능 이용")
-        _orguse = (uv.assign(소속기관=uv.get("organization", pd.Series(index=uv.index, dtype=object)).fillna("미입력").replace("", "미입력"))
+        _orguse = (uv.assign(소속기관=uv.get("organization", pd.Series(index=uv.index, dtype=object)).fillna("").map(_org_canonical).replace("", "미입력"))
                      .groupby("소속기관", dropna=False).size().reset_index(name="기능 이용 횟수")
                      .sort_values("기능 이용 횟수", ascending=False))
         smart_table(_orguse, width="stretch", hide_index=True)
@@ -6087,6 +6377,7 @@ _PIN_BUTTON_EXACT = {
     # 인증/이미지/카메라/음성 입력은 Streamlit이 값을 소유하는 비-settable 위젯이다.
     # 이 키를 _pin_sync가 session_state에 다시 쓰면 StreamlitValueAssignmentNotAllowedError가 난다.
     "auth_login_btn", "auth_signup_btn", "auth_reset_btn", "auth_logout_sidebar",
+    "auth_g_start", "auth_g_cancel",   # Google 로그인 첫 방문(소속 입력) 화면
     "table_img_up", "table_cam", "img_parse_btn", "image_table_editor", "use_image_table",
     "voice_data_audio", "voice_parse_btn", "voice_rows_editor", "voice_append",
     "voice_new", "voice_clear",
