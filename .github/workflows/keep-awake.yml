@@ -1,0 +1,53 @@
+name: Keep Streamlit apps awake
+
+on:
+  schedule:
+    - cron: "17 */4 * * *"   # 4시간마다 (UTC 기준)
+  workflow_dispatch:         # 수동 실행 버튼
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Visit apps
+        run: |
+          python - <<'EOF'
+          import re
+          from playwright.sync_api import sync_playwright
+
+          URLS = [
+              "https://smart-stats-agent-kamnrancn5hkm5bngfwf8a.streamlit.app/",
+              "https://smart-stats-agent-v2.streamlit.app/",
+          ]
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              for url in URLS:
+                  page = browser.new_page()
+                  try:
+                      page.goto(url, timeout=90000)
+                      page.wait_for_timeout(8000)
+                      btn = page.get_by_role("button", name=re.compile("get this app back up", re.I))
+                      if btn.count() > 0:
+                          btn.first.click()
+                          print("잠들어 있어서 깨움:", url)
+                          page.wait_for_timeout(90000)
+                      else:
+                          print("이미 깨어 있음:", url)
+                          page.wait_for_timeout(20000)
+                  except Exception as e:
+                      print("오류:", url, e)
+                  finally:
+                      page.close()
+              browser.close()
+          EOF
