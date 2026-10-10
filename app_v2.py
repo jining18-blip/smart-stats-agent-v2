@@ -2729,11 +2729,14 @@ def _remember_read():
 
 def _remember_save(refresh_token):
     """로그인 상태 유지를 켠 세션에서 매 화면 호출. 같은 key라 브라우저에서는 한 번만 실행된다."""
-    import json, time, hashlib
-    payload = json.dumps({"rt": refresh_token, "exp": time.time() + _REMEMBER_DAYS * 86400})
+    import json, hashlib
+    # 만료 시각은 브라우저에서 계산한다. 예전처럼 파이썬에서 time.time()을 넣으면 실행할 때마다
+    # 식이 달라져 부품이 매번 다시 저장하고 → 화면을 다시 그리고 → 또 저장하는 무한 반복이 생겼다
+    # (로그인 상태 유지를 켠 창이 가만히 있어도 계속 다시 실행되어 CPU를 다 써 버림).
     tag = hashlib.sha1(refresh_token.encode()).hexdigest()[:10]
     gen = st.session_state.get("_auth_remember_gen", 0)
-    _js_eval(f"localStorage.setItem('{_REMEMBER_KEY}', {json.dumps(payload)}) || 'ok'",
+    _js_eval(f"localStorage.setItem('{_REMEMBER_KEY}', JSON.stringify({{rt: {json.dumps(refresh_token)}, "
+             f"exp: Date.now() / 1000 + {_REMEMBER_DAYS * 86400}}})) || 'ok'",
              key=f"ssa_remember_save_{gen}_{tag}")
 
 
