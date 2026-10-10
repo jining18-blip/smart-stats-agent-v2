@@ -58,6 +58,8 @@ _KOREAN_FONT = None
 # 문의처 — 사이드바·로그인 화면·오류 안내·사용설명서에 함께 표시된다(버전1과 같음).
 CONTACT_NAME = "경상북도농업기술원 영양고추연구소 이효진"
 CONTACT_EMAIL = "hyo99@korea.kr"
+# 관리자 화면에서 버전1/버전2 로그인·이용 기록을 나눠 보기 위한 표시 (버전1 코드는 "V1")
+APP_VERSION = "V2"
 
 
 def set_korean_font():
@@ -2669,12 +2671,13 @@ def _record_login(user):
     try:
         meta = user.get("user_metadata") or {}
         now = _now_utc()
-        _fs_set("profiles", user.get("id"), {"email": user.get("email", ""), "last_login_at": now})
+        _fs_set("profiles", user.get("id"), {"email": user.get("email", ""), "last_login_at": now,
+                                             f"last_login_{APP_VERSION.lower()}": now})
         _fs_add("login_events", {
             "user_id": user.get("id"), "email": user.get("email", ""),
             "name": meta.get("name", ""), "organization_type": meta.get("organization_type", ""),
             "organization": meta.get("organization", ""), "department": meta.get("department", ""),
-            "logged_in_at": now})
+            "logged_in_at": now, "app": APP_VERSION})
     except Exception:
         pass
 
@@ -2869,7 +2872,7 @@ def _record_usage(action):
             "user_id": user.get("id"), "email": user.get("email", ""),
             "name": meta.get("name", ""), "organization": meta.get("organization", ""),
             "department": meta.get("department", ""), "action": str(action)[:300],
-            "used_at": _now_utc()})
+            "used_at": _now_utc(), "app": APP_VERSION})
     except Exception:
         pass
 
@@ -8186,8 +8189,23 @@ def money_table(df, dec_overrides=None):
     return out
 
 
+_LOG_REPEAT_SEC = 30 * 60   # 같은 작업을 이 시간 안에 연달아 하면 1번으로 친다
+
+
 def log_action(what):
-    import datetime
+    """분석 이력에 남기고 이용 기록(Firebase)에 저장한다.
+
+    분석 결과가 화면에 떠 있는 동안 다른 것을 누르면 화면 전체를 다시 그리면서 같은 분석
+    코드가 다시 실행된다. 예전에는 그때마다 같은 기록을 또 남기고 서버에 저장하러 다녀와서
+    화면이 느려지고 이용 횟수도 부풀려졌다. 같은 작업을 30분 안에 연달아 하면 1번만 남긴다.
+    """
+    import datetime, time as _time
+    seen = st.session_state.setdefault("_log_seen", {})
+    now, key = _time.time(), str(what)
+    last = seen.get(key)
+    seen[key] = now
+    if last is not None and now - last < _LOG_REPEAT_SEC:
+        return
     st.session_state.setdefault("log", []).append(
         {"시각": datetime.datetime.now().strftime("%H:%M:%S"), "작업": what})
     _record_usage(what)
